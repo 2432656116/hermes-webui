@@ -2613,7 +2613,7 @@ def _stream_writeback_can_supersede_recovery_marker(session, msg_text):
     if last.get('type') != 'interrupted':
         return False
     content = str(last.get('content') or '')
-    if 'Response interrupted' not in content or 'WebUI process restarted' not in content:
+    if 'Response interrupted' not in content or 'before this turn finished' not in content:
         return False
 
     expected = ' '.join(str(msg_text or '').split())

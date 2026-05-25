@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Clarify `Response interrupted` recovery markers so they report that the live response stream stopped instead of asserting that the WebUI process restarted. The recovery path now records distinct interruption causes for real process restarts, stream/run split-brain, and lost worker bookkeeping; browser-side SSE transport failures show a separate `Connection interrupted` message, client-side `BrokenPipeError` disconnects no longer get logged as server 500s, and chat/gateway SSE errors emit rate-limited, body-capped, sanitized client diagnostics to `/api/client-events/log` for future root-cause checks. The stream-status `terminal_state` value for lost-worker bookkeeping changes from `stale-from-restart` to `lost-worker-bookkeeping`, matching the new non-restart wording.
+
 ## [v0.51.131] — 2026-05-24 — Release DC (stage-batch13 — 6-PR notes-drawer + context-parity + PWA-swipe + locale polish)
 
 ### Added
@@ -32,8 +36,6 @@
 - **6,503 pytest passed** (sequential mode; the test infrastructure uses a single test server that doesn't support xdist parallelism — known limitation, tracked separately).
 - **Opus Advisor verdict: SHIP-AS-IS.** Zero MUST-FIX. Three SHOULD-FIX items filed as follow-up issues (incomplete locale coverage for notes-drawer i18n keys, `_joplin_api_get` URL-token defense-in-depth, prefill `setattr` cache-reuse safety net).
 - **#2527 i18n coverage**: 10 of the 11 non-en locales currently ship the English string `'Third-party notes'` for the drawer header. Since the drawer is default-off, user impact is zero today; follow-up issue tracks proper translations before any default-on transition.
-
-
 
 ## [v0.51.130] — 2026-05-24 — Release DB (stage-batch12 — 3-PR profile-isolation + boot-precedence + workspace Artifacts tab)
 
@@ -142,6 +144,7 @@
 - Full pytest: 6,424 passed / 6 skipped / 3 xpassed / 8 subtests passed.
 - UX evidence for #2812 captured at 1280/1440/1920/mobile (iPhone 14 emulation); Telegram-approved.
 - File a follow-up issue for pdeathsig-on-supervisor-thread hardening (#2854 deferred Option B) and French-locale `open_in_vscode` parity gap (predates this batch, Opus advisor flagged).
+
 
 ## [v0.51.126] — 2026-05-24 — Release CX (stage-batch8 — 2-PR low-risk batch — kanban markdown + live activity timeline)
 
@@ -326,7 +329,6 @@
 - **PR #2738** by @weidzhou — `_write_session_index()` full-rebuild path now deduplicates entries by `session_id`. When old-format `session_*.json` files coexist with WebUI-format `xxx.json` files sharing the same `session_id`, the index produced duplicate Vue `:key` entries and crashed the frontend with a blank page. The lazy rebuild now uses `dict[session_id → compact_entry]` keyed on session_id, with the higher `message_count` entry winning on conflict.
 - **PR #2730** by @ashbuildslife — Sanitize git fetch diagnostics before returning update-check errors to the browser. New `_sanitize_git_diagnostic()` in `api/updates.py` strips credentialed URL userinfo (`user:token@host`), GitHub token shapes (`ghp_*`, `gho_*`, `github_pat_*`), and secret-looking query parameters (`?access_token=`, `?token=`, `?password=`, `?auth=`, `?key=`), then caps the message at 300 characters. Empirically verified that plain `https://github.com/owner/repo.git` URLs and SSH-style `git@host:owner/repo` remotes pass through untouched — only credentialed shapes are redacted. Update-check failure context (e.g. `Authentication failed`, network errors) is preserved.
 - **PR #2742** by @Isla-Liu — Per-turn SQLite connection leak in handoff-summary path (#2233). Two functions on the `/api/session/handoff-summary` hot path were opening `sqlite3.connect(...)` inside a bare `with` statement, which commits the transaction at scope exit but does NOT close the connection. Per-turn invocations accumulated `state.db`/`state.db-wal` file descriptors and CPython heap pages on long-lived worker threads, surfacing as multi-GB VmRSS / 6× duplicated state.db fds on long-running installs. Wrapped both call sites with `contextlib.closing(...)` (already imported and used at 7 other sites in the same files) so the connection is closed deterministically: `api/models.py::count_conversation_rounds` and `api/routes.py::_persist_handoff_summary_to_state_db`. Regression test loops both functions 20× against a tmp `state.db` and asserts `/proc/<pid>/fd` count does not grow more than 2. Live soak: fd growth = 0, VmRSS growth = 0 KB across 20 POSTs.
-
 ## [v0.51.107] — 2026-05-21 — Release CE (stage-400 — 8-PR batch — pinned-sessions-limit getter rename + uploaded-file user-turn dedupe + active-run repair guard + incremental KaTeX streaming + profile default model on fresh boot + French locale completion + update-check error surfacing + release-update apply path)
 
 ### Fixed

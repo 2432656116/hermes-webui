@@ -23,7 +23,7 @@ import uuid
 import re
 from pathlib import Path
 from contextlib import closing
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     is_cli_session_row,
@@ -75,6 +75,21 @@ _CSP_REPORT_RATE_LIMIT_LOCK = threading.Lock()
 _CSP_REPORT_RATE_LIMIT_WINDOW_SECONDS = 60
 _CSP_REPORT_RATE_LIMIT_MAX = 100
 _CSP_REPORT_MAX_BODY_BYTES = 64 * 1024
+_CLIENT_EVENT_LOGGER = logging.getLogger("client_event")
+_CLIENT_EVENT_RATE_LIMIT: dict[str, list[float]] = {}
+_CLIENT_EVENT_RATE_LIMIT_LOCK = threading.Lock()
+_CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS = 60
+_CLIENT_EVENT_RATE_LIMIT_MAX = 30
+_CLIENT_EVENT_MAX_BODY_BYTES = 4 * 1024
+_CLIENT_EVENT_ALLOWED_FIELDS = {
+    "event": 64,
+    "source": 80,
+    "session_id": 128,
+    "stream_id": 128,
+    "visibility_state": 32,
+    "url_path": 256,
+    "reason": 160,
+}
 
 
 def _session_field(session, field, default=None):
@@ -1126,7 +1141,7 @@ def _run_journal_status_payload(summary: dict, *, active: bool = False) -> dict:
     terminal = bool(summary.get("terminal"))
     terminal_state = summary.get("terminal_state")
     if not active and not terminal:
-        terminal_state = "stale-from-restart"
+        terminal_state = "lost-worker-bookkeeping"
     return {
         "session_id": summary.get("session_id"),
         "run_id": summary.get("run_id"),
@@ -1371,6 +1386,20 @@ def _csp_report_rate_limited(handler, *, now: float | None = None) -> bool:
     return False
 
 
+def _client_event_rate_limited(handler, *, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    key = _client_ip_for_rate_limit(handler)
+    cutoff = now - _CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS
+    with _CLIENT_EVENT_RATE_LIMIT_LOCK:
+        timestamps = [ts for ts in _CLIENT_EVENT_RATE_LIMIT.get(key, []) if ts >= cutoff]
+        if len(timestamps) >= _CLIENT_EVENT_RATE_LIMIT_MAX:
+            _CLIENT_EVENT_RATE_LIMIT[key] = timestamps
+            return True
+        timestamps.append(now)
+        _CLIENT_EVENT_RATE_LIMIT[key] = timestamps
+    return False
+
+
 def _send_no_content(handler, status: int = 204) -> bool:
     handler.send_response(status)
     handler.send_header("Content-Length", "0")
@@ -1408,6 +1437,105 @@ def _handle_csp_report(handler) -> bool:
     payload = _read_csp_report_payload(handler)
     _CSP_REPORT_LOGGER.info("CSP report from %s: %s", _client_ip_for_rate_limit(handler), payload)
     return _send_no_content(handler)
+
+
+def _bounded_client_event_string(value, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _sanitize_client_event_url_path(value) -> str | None:
+    text = _bounded_client_event_string(value, 1024)
+    if not text:
+        return None
+    try:
+        parsed = urlsplit(text)
+        path = parsed.path or "/"
+    except Exception:
+        path = text.split("?", 1)[0] or "/"
+    if not path.startswith("/"):
+        path = "/" + path.lstrip("/")
+    return path[: _CLIENT_EVENT_ALLOWED_FIELDS["url_path"]]
+
+
+def _sanitize_client_event_payload(payload: dict | None) -> dict:
+    """Whitelist tiny browser diagnostic events and discard sensitive content.
+
+    Client-side SSE diagnostics should explain transport failures without
+    persisting prompts, cookies, query strings, headers, or arbitrary browser
+    payloads. This helper intentionally keeps only bounded scalar metadata.
+    """
+    if not isinstance(payload, dict):
+        return {"event": "unknown"}
+    sanitized: dict[str, object] = {}
+    for field, limit in _CLIENT_EVENT_ALLOWED_FIELDS.items():
+        if field == "url_path":
+            value = _sanitize_client_event_url_path(payload.get(field))
+        else:
+            value = _bounded_client_event_string(payload.get(field), limit)
+        if value is not None:
+            sanitized[field] = value
+    ready_state = payload.get("ready_state")
+    if isinstance(ready_state, bool):
+        pass
+    elif isinstance(ready_state, int) and 0 <= ready_state <= 3:
+        sanitized["ready_state"] = ready_state
+    online = payload.get("online")
+    if isinstance(online, bool):
+        sanitized["online"] = online
+    elif isinstance(online, str):
+        lowered = online.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            sanitized["online"] = True
+        elif lowered in {"false", "0", "no", "off"}:
+            sanitized["online"] = False
+    if "event" not in sanitized:
+        sanitized["event"] = "unknown"
+    return sanitized
+
+
+def _read_client_event_payload(handler) -> dict:
+    try:
+        length = int(handler.headers.get("Content-Length", 0))
+    except Exception:
+        length = 0
+    if length > _CLIENT_EVENT_MAX_BODY_BYTES:
+        try:
+            handler.rfile.read(_CLIENT_EVENT_MAX_BODY_BYTES)
+        except Exception:
+            pass
+        # Do not leave unread request-body bytes on an HTTP/1.1 keep-alive
+        # socket. Draining an arbitrary oversized body can tie up a worker;
+        # closing the connection after the bounded read preserves framing for
+        # the next request without turning diagnostics into a slow-drain sink.
+        try:
+            handler.close_connection = True
+        except Exception:
+            pass
+        return {"event": "discarded", "reason": "body_too_large"}
+    raw = handler.rfile.read(length) if length else b"{}"
+    try:
+        decoded = raw.decode("utf-8")
+        payload = json.loads(decoded)
+    except Exception:
+        return {"event": "invalid", "reason": "invalid_json"}
+    return payload if isinstance(payload, dict) else {"event": "invalid", "reason": "not_object"}
+
+
+def _handle_client_event_log(handler, body: dict) -> bool:
+    if _client_event_rate_limited(handler):
+        _CLIENT_EVENT_LOGGER.warning(
+            "Dropped client event from %s: rate limit exceeded",
+            _client_ip_for_rate_limit(handler),
+        )
+        return j(handler, {"ok": False, "error": "rate_limited"}, status=429) or True
+    payload = _sanitize_client_event_payload(body)
+    _CLIENT_EVENT_LOGGER.info("Client event from %s: %s", _client_ip_for_rate_limit(handler), payload)
+    return j(handler, {"ok": True, "event": payload.get("event")}) or True
 
 
 def _normalize_provider_id(value: str | None) -> str:
@@ -4707,6 +4835,11 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/transcribe":
         return handle_transcribe(handler)
+
+    if parsed.path == "/api/client-events/log":
+        if diag:
+            diag.stage("read_client_event_body")
+        return _handle_client_event_log(handler, _read_client_event_payload(handler))
 
     if diag:
         diag.stage("read_body")
