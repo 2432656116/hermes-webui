@@ -173,7 +173,7 @@ from api.updates import WEBUI_VERSION
 class QuietHTTPServer(ThreadingHTTPServer):
     """Custom HTTP server that silently handles common network errors."""
     daemon_threads = True
-    request_queue_size = 64
+    request_queue_size = 256
 
     def __init__(self, *args, **kwargs):
         server_address = args[0] if args else kwargs.get('server_address', None)

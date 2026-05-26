@@ -2146,6 +2146,8 @@ function _schedulePendingSessionListApply(){
 }
 
 function _applySessionListPayload(sessData, projData){
+  // ── Update session list cache timestamp ──
+  _sessionListCacheTime = Date.now();
   // Server's other_profile_count tells us how many sessions exist outside the
   // active profile so the "Show N from other profiles" toggle can render
   // without a second round-trip. Stashed on the module for renderSessionListFromCache.
@@ -2183,8 +2185,15 @@ function _applySessionListPayload(sessData, projData){
 
 async function renderSessionList(opts={}){
   const deferWhileInteracting=Boolean(opts&&opts.deferWhileInteracting);
+  const force=Boolean(opts&&opts.force);
   const _gen = ++_renderSessionListGen;
   if(!deferWhileInteracting) _pendingSessionListPayload=null;
+  // ── Cache short-circuit: skip HTTP fetch when cache is fresh (< TTL) ──
+  const cacheAge=Date.now()-_sessionListCacheTime;
+  if(!force&&_allSessions.length>0&&cacheAge<_sessionListCacheTTLMs){
+    renderSessionListFromCache();
+    return;
+  }
   try{
     if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
     const allProfilesQS = _showAllProfiles ? '?all_profiles=1' : '';
@@ -2209,9 +2218,12 @@ let _gatewayPollTimer = null;
 let _gatewayProbeInFlight = false;
 let _gatewaySSEWarningShown = false;
 const _gatewayFallbackPollMs = 30000;
-const _streamingPollMs = 5000;
-const _sessionTimeRefreshMs = 60000;
-const _activeSessionExternalRefreshMs = 5000;
+const _streamingPollMs = 15000;
+const _sessionTimeRefreshMs = 120000;
+const _activeSessionExternalRefreshMs = 15000;
+const _sessionListCacheTTLMs = 3000;
+let _sessionListCacheTime = 0;
+function _invalidateSessionListCache(){_sessionListCacheTime=0;}
 let _streamingPollTimer = null;
 let _sessionTimeRefreshTimer = null;
 let _activeSessionExternalRefreshTimer = null;
@@ -2431,6 +2443,7 @@ function startGatewaySSE(){
         if(data.sessions){
           stopGatewayPollFallback();
           _gatewaySSEWarningShown = false;
+          _invalidateSessionListCache();
           renderSessionList({deferWhileInteracting:true}); // re-fetch and re-render
           // If the active session received new gateway messages, refresh the conversation view.
           // S.busy check prevents stomping on an in-progress WebUI response.
