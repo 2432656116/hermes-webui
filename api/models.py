@@ -649,11 +649,32 @@ class Session:
         if not skip_index:
             _write_session_index(updates=[self])
 
+        # ── SQLite mirror (opt-in, best-effort) ────────────────────────
+        try:
+            from api.session_store_sqlite import SQLITE_ENABLED, save_session
+            if SQLITE_ENABLED:
+                save_session(self.__dict__)
+        except Exception:
+            pass
+
     @classmethod
     def load(cls, sid):
         # Validate session ID format to prevent path traversal
         if not sid or not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
             return None
+
+        # ── SQLite primary store (opt-in) ──────────────────────────────────
+        try:
+            from api.session_store_sqlite import SQLITE_ENABLED, load_session
+            if SQLITE_ENABLED:
+                data = load_session(sid)
+                if data:
+                    data["messages"], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get("messages"))
+                    session = cls(**data)
+                    return session
+        except ImportError:
+            pass
+
         p = SESSION_DIR / f'{sid}.json'
         if not p.exists():
             return None
