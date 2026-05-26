@@ -156,6 +156,19 @@ def build_system_health_payload() -> dict[str, Any]:
 
     available = any(metrics[name] is not None for name in metrics)
     status = "ok" if available and not errors else "partial" if available else "unavailable"
+
+    # ── Agent Bridge status ──────────────────────────────────────────
+    bridge_status = "disabled"
+    try:
+        from api.config import AGENT_BRIDGE_ENABLED, AGENT_BRIDGE_SOCKET
+        if AGENT_BRIDGE_ENABLED:
+            from api.bridge_client import BridgeClient
+            client = BridgeClient(AGENT_BRIDGE_SOCKET)
+            health = client.health_check()
+            bridge_status = "ok" if health.get("healthy") else "offline"
+    except Exception:
+        bridge_status = "error"
+
     return {
         "status": status,
         "available": available,
@@ -164,4 +177,5 @@ def build_system_health_payload() -> dict[str, Any]:
         "memory": metrics["memory"],
         "disk": metrics["disk"],
         "errors": errors,
+        "agent_bridge": bridge_status,
     }

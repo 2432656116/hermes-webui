@@ -4386,6 +4386,29 @@ def unregister_active_run(stream_id: str) -> None:
         ACTIVE_RUNS.pop(stream_id, None)
         LAST_RUN_FINISHED_AT = time.time()
 
+# ── Agent Bridge IPC (optional, zero-dependency) ──────────────────────────
+# When enabled, chat turns are delegated to a separate agent_bridge process
+# over a Unix socket instead of importing AIAgent directly. This eliminates
+# GIL contention between HTTP request handling and LLM calls.
+#
+# Enable with env: HERMES_WEBUI_BRIDGE=1
+# Bridge socket path: /tmp/hermes-webui-bridge.sock
+AGENT_BRIDGE_ENABLED = os.environ.get("HERMES_WEBUI_BRIDGE", "").strip() in ("1", "true", "yes")
+AGENT_BRIDGE_SOCKET = os.environ.get("HERMES_WEBUI_BRIDGE_SOCKET", "/tmp/hermes-webui-bridge.sock")
+
+
+def is_bridge_available() -> bool:
+    """Check if the agent bridge process is running and reachable."""
+    if not AGENT_BRIDGE_ENABLED:
+        return False
+    try:
+        from api.bridge_client import BridgeClient
+        client = BridgeClient(AGENT_BRIDGE_SOCKET)
+        result = client.health_check()
+        return result.get("healthy", False)
+    except Exception:
+        return False
+
 # Agent cache: reuse AIAgent across messages in the same WebUI session so that
 # _user_turn_count survives between turns.  This mirrors the gateway's
 # _agent_cache pattern and is required for injectionFrequency: "first-turn".

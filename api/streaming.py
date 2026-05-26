@@ -3419,6 +3419,29 @@ def _run_agent_streaming(
         STREAM_REASONING_TEXT[stream_id] = ''  # start accumulating reasoning trace (#1361 §A)
         STREAM_LIVE_TOOL_CALLS[stream_id] = []  # start accumulating tool calls (#1361 §B)
 
+    # ── Agent Bridge IPC integration ──────────────────────────────────
+    # When the bridge is enabled and reachable, delegate the entire agent
+    # turn to the separate bridge process instead of importing AIAgent
+    # directly. This eliminates GIL contention.
+    try:
+        from api.config import AGENT_BRIDGE_ENABLED, is_bridge_available
+        if AGENT_BRIDGE_ENABLED and is_bridge_available():
+            from api.bridge_client import run_via_bridge
+            run_via_bridge(
+                session_id, msg_text, model, workspace, stream_id,
+                attachments=attachments,
+                model_provider=model_provider,
+                ephemeral=ephemeral,
+                goal_related=goal_related,
+            )
+            return
+        elif AGENT_BRIDGE_ENABLED:
+            logger.warning(
+                "Agent bridge enabled but not reachable — falling back to direct agent import"
+            )
+    except Exception:
+        logger.warning("Bridge check failed, using direct agent import", exc_info=True)
+
     agent = None
     _live_prompt_estimate_tokens = [0]
     _live_prompt_exact_tokens = [0]
