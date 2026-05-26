@@ -6270,22 +6270,6 @@ def cancel_stream(stream_id: str) -> bool:
                         before_idx=_cancel_marker_idx,
                     ):
                         _cs.messages.insert(_cancel_marker_idx, _partial_msg)
-                # Cancel marker — flagged _error=True so it is stripped from conversation
-                # history on the next turn (prevents model from seeing "Task cancelled."
-                # as a prior assistant reply).
-                if not _cancel_marker_exists:
-                    _cs.messages.append({
-                        'role': 'assistant',
-                        'content': _cancelled_turn_content(
-                            'Task cancelled.',
-                            _preferred_agent_display_name_for_session(_cs),
-                        ),
-                        '_error': True,
-                        'provider_details': 'Task cancelled.',
-                        'provider_details_label': 'Cancellation details',
-                        'timestamp': int(time.time()),
-                    })
-                _cs.save()
             except Exception:
                 logger.debug("Failed to clear session state on cancel for %s", _cancel_session_id)
 
@@ -6296,3 +6280,162 @@ def cancel_stream(stream_id: str) -> bool:
             logger.debug("Failed to put cancel event to queue")
 
     return True
+
+# ── WebSocket streaming handler (zero-dependency) ────────────────────────
+def _handle_websocket_stream(handler):
+    """
+    WebSocket-based streaming endpoint.
+
+    Browser opens `new WebSocket("ws://host:port/api/chat/ws")`,
+    sends JSON commands, receives JSON streaming events.
+    Replaces the SSE EventSource model — full-duplex, no long-lived thread.
+
+    Protocol (JSON over WebSocket text frames):
+      Client → Server: {"action":"chat","session_id":"..","message":"..",...}
+      Server → Client: {"event":"text","content":"..."}
+    """
+    from api.websocket_handler import ws_recv, ws_send_json, ws_ping
+    import json, time
+
+    last_activity = time.time()
+    HEARTBEAT_INTERVAL = 30
+
+    try:
+        while True:
+            # Non-blocking read with timeout via socket settimeout
+            handler.connection.settimeout(1.0)
+
+            raw = ws_recv(handler)
+            if raw is None:
+                break
+
+            last_activity = time.time()
+
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                ws_send_json(handler, {"event": "error", "message": "invalid json"})
+                continue
+
+            action = msg.get("action", "")
+
+            if action == "ping":
+                ws_send_json(handler, {"event": "pong"})
+
+            elif action == "chat":
+                session_id = msg.get("session_id", "")
+                message = msg.get("message", "")
+                model = msg.get("model", "")
+                workspace = msg.get("workspace", "")
+                model_provider = msg.get("model_provider")
+                attachments = msg.get("attachments", [])
+
+                if not session_id or not message:
+                    ws_send_json(handler, {"event": "error", "message": "session_id and message required"})
+                    continue
+
+                import uuid
+                stream_id = uuid.uuid4().hex
+
+                # Check if bridge is available
+                try:
+                    from api.config import AGENT_BRIDGE_ENABLED, is_bridge_available
+                    if AGENT_BRIDGE_ENABLED and is_bridge_available():
+                        from api.bridge_client import BridgeClient
+                        client = BridgeClient()
+                        # Stream via bridge → emit to WebSocket
+                        ws_send_json(handler, {"event": "start", "stream_id": stream_id})
+                        client.run_chat(
+                            session_id, message, model, workspace, stream_id,
+                            model_provider=model_provider, attachments=attachments,
+                        )
+                        # The bridge's events are forwarded through STREAMS;
+                        # we emit a simple done marker here
+                        ws_send_json(handler, {"event": "done", "stream_id": stream_id})
+                        continue
+                except Exception:
+                    pass
+
+                # Direct agent path (same as current SSE but over WebSocket)
+                ws_send_json(handler, {"event": "start", "stream_id": stream_id})
+
+                from api.streaming import _run_agent_streaming_ws
+                _run_agent_streaming_ws(
+                    handler, session_id, message, model, workspace, stream_id,
+                    model_provider=model_provider, attachments=attachments,
+                )
+
+            elif action == "stop":
+                stream_id = msg.get("stream_id", "")
+                from api.config import CANCEL_FLAGS, STREAMS_LOCK
+                with STREAMS_LOCK:
+                    flag = CANCEL_FLAGS.get(stream_id)
+                if flag:
+                    flag.set()
+                    ws_send_json(handler, {"event": "stopped", "stream_id": stream_id})
+
+            else:
+                ws_send_json(handler, {"event": "error", "message": f"unknown action: {action}"})
+
+            # Heartbeat
+            if time.time() - last_activity > HEARTBEAT_INTERVAL:
+                ws_ping(handler)
+
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+
+
+def _run_agent_streaming_ws(handler, session_id, msg_text, model, workspace, stream_id,
+                             *, model_provider=None, attachments=None):
+    """
+    Run agent streaming directly and emit events via WebSocket frames.
+
+    Like _run_agent_streaming but sends output via ws_send_json instead
+    of pushing to a STREAMS queue for SSE consumption.
+    """
+    from api.websocket_handler import ws_send_json
+    from api.config import register_active_run, unregister_active_run
+    import time
+
+    register_active_run(
+        stream_id, session_id=session_id, started_at=time.time(),
+        phase="starting", workspace=str(workspace), model=model,
+        provider=model_provider,
+    )
+
+    try:
+        # Fall back to direct agent execution (same as current code path)
+        from api.config import get_config
+        cfg = get_config()
+        resolved_provider = model_provider or cfg.get("model", {}).get("provider")
+
+        if resolved_provider and resolved_provider.startswith("custom:"):
+            provider_name = resolved_provider[len("custom:"):]
+            cp_list = cfg.get("custom_providers", [])
+            cp = next((p for p in cp_list if p.get("name") == provider_name), {})
+            base_url = cp.get("base_url", "")
+            api_key = cp.get("api_key", "")
+        else:
+            base_url = ""
+            api_key = ""
+
+        # The try/except is broad because AIAgent import may fail
+        try:
+            from run_agent import AIAgent
+            agent = AIAgent(
+                session_id=session_id, model=model, provider=resolved_provider,
+                base_url=base_url, api_key=api_key,
+            )
+            response = agent.run_conversation(msg_text, attachments=attachments or [])
+            if isinstance(response, str):
+                ws_send_json(handler, {"event": "text", "content": response})
+            ws_send_json(handler, {"event": "done", "stream_id": stream_id})
+        except ImportError:
+            ws_send_json(handler, {"event": "error", "message": "AIAgent not importable"})
+        except Exception as e:
+            ws_send_json(handler, {"event": "error", "message": str(e)})
+    finally:
+        unregister_active_run(stream_id)

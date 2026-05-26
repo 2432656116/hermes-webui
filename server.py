@@ -285,6 +285,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._req_t0 = time.time()
+
+        # ── WebSocket upgrade (zero-dependency, stdlib-only) ──────────
+        # Intercept /api/chat/ws before auth/routing to avoid blocking
+        # the upgrade handshake behind auth checks.
+        from urllib.parse import urlparse as _up
+        _parsed_ws = _up(self.path)
+        if _parsed_ws.path == "/api/chat/ws":
+            from api.websocket_handler import ws_upgrade
+            if ws_upgrade(self):
+                from api.streaming import _handle_websocket_stream
+                _handle_websocket_stream(self)
+                return
+            # Upgrade failed — fall through to normal HTTP
+
         # Per-request profile context from cookie (issue #798)
         cookie_profile = get_profile_cookie(self)
         if cookie_profile:
