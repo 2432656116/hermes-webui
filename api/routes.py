@@ -3984,6 +3984,14 @@ def handle_get(handler, parsed) -> bool:
         refresh = (query.get("refresh", [""])[0] or "").strip().lower() in {"1", "true", "yes", "on"}
         return j(handler, get_provider_quota(provider_id, refresh=refresh))
 
+    # ── Cron live activity tracker ──────────────────────────────────────
+    if parsed.path == "/api/cron/live-status":
+        try:
+            from api.cron_tracker import get_snapshot
+            return j(handler, get_snapshot())
+        except ImportError:
+            return j(handler, {"active": {}, "last_run": {}, "active_count": 0})
+
     if parsed.path == "/api/provider/cost-history":
         query = parse_qs(parsed.query)
         provider_id = (query.get("provider", [""])[0] or None)

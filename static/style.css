@@ -4541,3 +4541,27 @@ main.main.showing-logs > #mainLogs{display:flex;}
   text-align:left;
   unicode-bidi:isolate;
 }
+
+/* ── Cron live status bar ─────────────────────────────────── */
+.cron-live-status {
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--surface);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-height: 20px;
+  line-height: 1.4;
+}
+.cron-live-icon { flex-shrink: 0; opacity: 0.5; }
+.cron-live-text { flex: 1; min-width: 0; word-break: break-all; }
+.cron-live-status.active { color: var(--accent); }
+.cron-live-status.active .cron-live-icon { opacity: 1; animation: cron-pulse 2s infinite; }
+.cron-live-status.last-fail { color: #ef4444; }
+@keyframes cron-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
