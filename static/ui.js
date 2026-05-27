@@ -7205,6 +7205,43 @@ async function regenerateResponse(btn) {
   } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
+// ── Per-message token badge ("1.2K in / 0.8K out") ────────────────────
+function addTokenBadges(container) {
+  if (!window._showTokenUsage) return;
+  if (!S.messages || !S.messages.length) return;
+  var rows = (container || document).querySelectorAll('.msg-row[data-role="assistant"]');
+  if (!rows.length) return;
+  // Walk messages in order, match to assistant DOM rows
+  var aIdx = 0;
+  for (var i = 0; i < S.messages.length && aIdx < rows.length; i++) {
+    var m = S.messages[i];
+    if (!m || m.role !== 'assistant') continue;
+    var row = rows[aIdx];
+    aIdx++;
+    if (!row || row.querySelector('.msg-token-badge')) continue;
+    if (!m._turnUsage) continue;
+    var u = m._turnUsage;
+    if (!u.input_tokens && !u.output_tokens && !u.cost) continue;
+    var parts = [];
+    if (u.input_tokens) parts.push(_fmtToken(u.input_tokens) + ' in');
+    if (u.output_tokens) parts.push(_fmtToken(u.output_tokens) + ' out');
+    if (u.cost > 0) parts.push('$' + u.cost.toFixed(u.cost < 0.01 ? 4 : 2));
+    if (!parts.length) continue;
+    var badge = document.createElement('span');
+    badge.className = 'msg-token-badge';
+    badge.textContent = parts.join(' / ');
+    badge.title = parts.join(' / ');
+    var role = row.querySelector('.msg-role.assistant');
+    if (role) role.appendChild(badge);
+  }
+}
+function _fmtToken(n) {
+  n = Number(n || 0);
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+
 function postProcessRenderedMessages(container) {
   highlightCode(container);
   addCopyButtons(container);
@@ -7216,6 +7253,7 @@ function postProcessRenderedMessages(container) {
   renderMermaidBlocks(container);
   renderKatexBlocks(container);
   initTreeViews(container);
+  addTokenBadges(container);
 }
 
 function highlightCode(container) {

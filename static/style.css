@@ -3545,6 +3545,21 @@ main.main.showing-logs > #mainLogs{display:flex;}
   font-variant-numeric: tabular-nums;
   line-height: 1.4;
 }
+.msg-token-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  white-space: nowrap;
+}
 .msg-time { opacity: .65; font-size: 10px; }
 .msg-role:hover .msg-time { opacity: 1; }
 
