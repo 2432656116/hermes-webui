@@ -1003,8 +1003,35 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _smdWrittenLen=0;
     _smdWrittenText='';
     if(!window.smd){_smdParser=null;return;}
-    const renderer=fade ? _streamFadeRenderer(el) : window.smd.default_renderer(el);
+    const baseRenderer=fade ? _streamFadeRenderer(el) : window.smd.default_renderer(el);
+    const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
     _smdParser=window.smd.parser(renderer);
+  }
+  function _smdRendererWithoutUnderscoreEmphasis(renderer){
+    if(!renderer||!window.smd) return renderer;
+    const baseAddToken=renderer.add_token;
+    const baseEndToken=renderer.end_token;
+    const baseAddText=renderer.add_text;
+    const tokenStack=[];
+    renderer.add_token=(data,token)=>{
+      if(token===window.smd.ITALIC_UND||token===window.smd.STRONG_UND){
+        const marker=token===window.smd.STRONG_UND?'__':'_';
+        tokenStack.push(marker);
+        baseAddText(data,marker);
+        return;
+      }
+      tokenStack.push(null);
+      baseAddToken(data,token);
+    };
+    renderer.end_token=(data)=>{
+      const marker=tokenStack.pop();
+      if(marker){
+        baseAddText(data,marker);
+        return;
+      }
+      baseEndToken(data);
+    };
+    return renderer;
   }
   // Helper: end the current smd parser (flushes remaining state) and null it out.
   function _smdEndParser(){
@@ -1056,8 +1083,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // Raw file:// anchors are rewritten to /api/media before the user can click them.
   const _SMD_SAFE_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.|api)/i;
   const _SMD_SAFE_IMG_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.)/i;
-  function _smdFileHref(raw){
+  function _smdLinkHref(raw){
     const href=String(raw||'');
+    if(/^workspace:\/\//i.test(href)){
+      try{
+        const rel=decodeURIComponent(href.replace(/^workspace:\/\//i,'')).replace(/^~\//,'').replace(/^\.\//,'');
+        return '#workspace='+encodeURIComponent(rel);
+      }catch(_){
+        return '#';
+      }
+    }
     if(!/^file:\/\//i.test(href)) return href;
     try{
       const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
@@ -1066,12 +1101,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
     }
   }
+  function _smdFileHref(raw){
+    return _smdLinkHref(raw);
+  }
   function _sanitizeSmdLinks(root){
     if(!root||!root.querySelectorAll) return;
     const _a=root.querySelectorAll('a[href]');
     for(let i=0;i<_a.length;i++){
       const n=_a[i],v=n.getAttribute('href')||'';
-      if(/^file:\/\//i.test(v)){n.setAttribute('href',_smdFileHref(v));continue;}
+      if(/^(file|workspace):\/\//i.test(v)){n.setAttribute('href',_smdLinkHref(v));continue;}
       if(!_SMD_SAFE_URL_RE.test(v)){n.removeAttribute('href');n.setAttribute('data-blocked-scheme','1');}
     }
     const _im=root.querySelectorAll('img[src]');
@@ -1182,8 +1220,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const isHref=window.smd&&attr===window.smd.HREF;
       const isSrc=window.smd&&attr===window.smd.SRC;
       const safeUrl=isSrc?_SMD_SAFE_IMG_URL_RE:_SMD_SAFE_URL_RE;
-      if(isHref&&/^file:\/\//i.test(String(value||''))){
-        baseSetAttr(data,attr,_smdFileHref(value));
+      if(isHref&&/^(file|workspace):\/\//i.test(String(value||''))){
+        baseSetAttr(data,attr,_smdLinkHref(value));
         return;
       }
       if((isHref||isSrc)&&!safeUrl.test(String(value||''))){
@@ -1352,9 +1390,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     };
     step();
   }
-  function _flushPendingSegmentRender(){
-    if(!assistantBody||!_renderPending) return;
-    _cancelAnimationFramePendingStreamRender();
+  function _flushPendingSegmentRender(options={}){
+    const force=!!(options&&options.force);
+    if(!assistantBody||(!force&&!_renderPending)) return;
+    if(_renderPending) _cancelAnimationFramePendingStreamRender();
     const displayText=segmentStart===0
       ? _parseStreamState().displayText
       : _stripXmlToolCalls(assistantText.slice(segmentStart));
@@ -1512,8 +1551,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(typeof updateThinking==='function') updateThinking(_liveThinkingText());
         else appendThinking(_liveThinkingText());
       }
-      _flushPendingSegmentRender();
       ensureAssistantRow(true);
+      _flushPendingSegmentRender({force:true});
+      if(typeof closeCurrentLiveActivityGroup==='function') closeCurrentLiveActivityGroup();
       _resetAssistantSegment();
       _scheduleRender();
     });
@@ -1565,7 +1605,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // Reset the live assistant row reference so that any text tokens arriving
       // after this tool call create a NEW segment appended below the tool card,
       // rather than updating the old segment that sits above it in the DOM.
-      _flushPendingSegmentRender();
+      _flushPendingSegmentRender({force:true});
       _freshSegment=true;
       _smdEndParser();
       _resetAssistantSegment();

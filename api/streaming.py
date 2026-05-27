@@ -10,7 +10,9 @@ import mimetypes
 import os
 import queue
 import re
+import shlex
 import sys
+import subprocess
 import threading
 import time
 import traceback
@@ -285,29 +287,117 @@ def _resolve_prefill_path(raw: str) -> Path:
     return path
 
 
+_PREFILL_SCRIPT_OUTPUT_LIMIT = 262_144
+
+
+def _prefill_not_configured() -> dict:
+    return {"status": "not_configured", "source": "none", "label": "", "messages": [], "message_count": 0}
+
+
+def _load_prefill_messages_file(file_raw: str, *, source: str = "file", status: str = "loaded") -> dict:
+    path = _resolve_prefill_path(file_raw)
+    label = path.name or "prefill file"
+    if not path.exists():
+        return {"status": "error", "source": source, "label": label, "messages": [], "message_count": 0, "error": "prefill file not found"}
+    try:
+        messages = _valid_prefill_messages(json.loads(path.read_text(encoding="utf-8")))
+        return {"status": status, "source": source, "label": label, "messages": messages, "message_count": len(messages)}
+    except Exception as exc:
+        return {"status": "error", "source": source, "label": label, "messages": [], "message_count": 0, "error": _redact_prefill_status_text(str(exc))}
+
+
+def _prefill_script_timeout(config_data: dict) -> float:
+    raw = os.getenv("HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT_TIMEOUT", "") or str(config_data.get("webui_prefill_messages_script_timeout") or "")
+    try:
+        return max(0.1, min(float(raw or 5), 30.0))
+    except Exception:
+        return 5.0
+
+
+def _prefill_script_command(raw) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return [str(part) for part in raw if str(part)]
+    parts = shlex.split(str(raw or ""))
+    if not parts:
+        return []
+    # A single script path mirrors prefill_messages_file path resolution.  More
+    # complex commands keep their argv untouched so admins can pass arguments.
+    if len(parts) == 1:
+        parts[0] = str(_resolve_prefill_path(parts[0]))
+    return parts
+
+
+def _messages_from_prefill_script_output(text: str) -> list[dict]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return []
+    try:
+        payload = json.loads(stripped)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        payload = payload.get("messages")
+    messages = _valid_prefill_messages(payload)
+    if messages:
+        return messages
+    return [{"role": "system", "content": stripped}]
+
+
+def _load_prefill_messages_script(config_data: dict) -> dict:
+    script_raw = os.getenv("HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT", "") or config_data.get("webui_prefill_messages_script")
+    if not script_raw:
+        return _prefill_not_configured()
+    command = _prefill_script_command(script_raw)
+    label = Path(command[0]).name if command else "prefill script"
+    if not command:
+        return {"status": "error", "source": "script", "label": label, "messages": [], "message_count": 0, "error": "prefill script is empty"}
+    try:
+        proc = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_prefill_script_timeout(config_data),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "source": "script", "label": label, "messages": [], "message_count": 0, "error": "prefill script timed out"}
+    except Exception as exc:
+        return {"status": "error", "source": "script", "label": label, "messages": [], "message_count": 0, "error": _redact_prefill_status_text(str(exc))}
+    if proc.returncode != 0:
+        err = _redact_prefill_status_text(proc.stderr or proc.stdout or f"prefill script exited {proc.returncode}")
+        return {"status": "error", "source": "script", "label": label, "messages": [], "message_count": 0, "error": err}
+    if len(proc.stdout.encode("utf-8")) > _PREFILL_SCRIPT_OUTPUT_LIMIT:
+        return {
+            "status": "error",
+            "source": "script",
+            "label": label,
+            "messages": [],
+            "message_count": 0,
+            "error": f"prefill script output exceeded {_PREFILL_SCRIPT_OUTPUT_LIMIT} bytes",
+        }
+    messages = _messages_from_prefill_script_output(proc.stdout)
+    return {"status": "loaded", "source": "script", "label": label, "messages": messages, "message_count": len(messages)}
+
+
 def _load_webui_prefill_context(
     config_data: Optional[dict] = None,
 ) -> dict:
     """Load configured WebUI session prefill messages.
 
-    Supports the same bounded JSON-file shape used by Hermes Agent.  WebUI does
-    not execute a configured prefill script here; session recall that requires
-    code execution should go through the normal MCP/tool path instead of an
-    always-on per-turn subprocess before SSE starts.
+    Supports the same bounded JSON-file shape used by Hermes Agent.  WebUI also
+    supports its own explicitly opt-in script hook so admins can bridge Joplin,
+    Obsidian, Notion, llm-wiki, or another local notes source into ephemeral
+    turn context without baking any one note provider into the WebUI.
     """
     cfg = config_data if isinstance(config_data, dict) else get_config()
+    script_context = _load_prefill_messages_script(cfg)
+    if script_context.get("status") != "not_configured":
+        return script_context
     file_raw = os.getenv("HERMES_PREFILL_MESSAGES_FILE", "") or str(cfg.get("prefill_messages_file") or "")
     if file_raw:
-        path = _resolve_prefill_path(file_raw)
-        label = path.name or "prefill file"
-        if not path.exists():
-            return {"status": "error", "source": "file", "label": label, "messages": [], "message_count": 0, "error": "prefill file not found"}
-        try:
-            messages = _valid_prefill_messages(json.loads(path.read_text(encoding="utf-8")))
-            return {"status": "loaded", "source": "file", "label": label, "messages": messages, "message_count": len(messages)}
-        except Exception as exc:
-            return {"status": "error", "source": "file", "label": label, "messages": [], "message_count": 0, "error": _redact_prefill_status_text(str(exc))}
-    return {"status": "not_configured", "source": "none", "label": "", "messages": [], "message_count": 0}
+        return _load_prefill_messages_file(file_raw)
+    return _prefill_not_configured()
 
 
 def _public_prefill_context_status(prefill_context: dict) -> dict:
@@ -4164,7 +4254,8 @@ def _run_agent_streaming(
             _session_db = None
             try:
                 from hermes_state import SessionDB
-                _session_db = SessionDB()
+                _state_db_path = (Path(_profile_home) / "state.db") if _profile_home else None
+                _session_db = SessionDB(db_path=_state_db_path)
             except Exception as _db_err:
                 print(f"[webui] WARNING: SessionDB init failed — session_search will be unavailable: {_db_err}", flush=True)
             resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
@@ -4230,28 +4321,50 @@ def _run_agent_streaming(
             except Exception as _ts_err:
                 print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
 
-            # Fallback model from profile config (e.g. for rate-limit recovery)
-            _fallback = _cfg.get('fallback_model') or _cfg.get('fallback_providers') or None
+            # Fallback model chain from profile config (e.g. for rate-limit or
+            # provider recovery). Match Hermes CLI/gateway semantics:
+            # fallback_providers entries are tried first, then legacy
+            # fallback_model entries are appended unless they duplicate an
+            # earlier provider/model/base_url route.
+            def _fallback_entries(_raw):
+                if isinstance(_raw, dict):
+                    _items = [_raw]
+                elif isinstance(_raw, list):
+                    _items = _raw
+                else:
+                    return []
+                _entries = []
+                for _entry in _items:
+                    if not isinstance(_entry, dict):
+                        continue
+                    _provider = str(_entry.get('provider') or '').strip()
+                    _model = str(_entry.get('model') or '').strip()
+                    if not _provider or not _model:
+                        continue
+                    _entries.append({
+                        'model': _model,
+                        'provider': _provider,
+                        'base_url': _entry.get('base_url'),
+                        'api_key': _entry.get('api_key'),
+                        'key_env': _entry.get('key_env'),
+                    })
+                return _entries
+
+            _fallback_chain = []
+            _fallback_seen = set()
             _fallback_resolved = None
-            if _fallback:
-                # Normalize: support both single dict (legacy) and list (chained fallback).
-                # Use the first valid entry as the fallback passed to AIAgent.
-                _fb_entry = None
-                if isinstance(_fallback, list):
-                    for _entry in _fallback:
-                        if isinstance(_entry, dict) and _entry.get('model'):
-                            _fb_entry = _entry
-                            break
-                elif isinstance(_fallback, dict) and _fallback.get('model'):
-                    _fb_entry = _fallback
-                if _fb_entry:
-                    _fallback_resolved = {
-                        'model': _fb_entry.get('model', ''),
-                        'provider': _fb_entry.get('provider', ''),
-                        'base_url': _fb_entry.get('base_url'),
-                        'api_key': _fb_entry.get('api_key'),
-                        'key_env': _fb_entry.get('key_env'),
-                    }
+            for _fallback_key in ('fallback_providers', 'fallback_model'):
+                for _fb_entry in _fallback_entries(_cfg.get(_fallback_key)):
+                    _identity = (
+                        str(_fb_entry.get('provider') or '').strip().lower(),
+                        str(_fb_entry.get('model') or '').strip().lower(),
+                        str(_fb_entry.get('base_url') or '').strip().rstrip('/').lower(),
+                    )
+                    if _identity in _fallback_seen:
+                        continue
+                    _fallback_seen.add(_identity)
+                    _fallback_chain.append(_fb_entry)
+            _fallback_resolved = _fallback_chain or None
 
             # Build kwargs defensively — guard newer params so the WebUI
             # degrades gracefully when run against an older hermes-agent build.
