@@ -3971,6 +3971,19 @@ def handle_get(handler, parsed) -> bool:
             bad(handler, str(exc), status=400)
         return True
 
+    # ── Hot update endpoints ────────────────────────────────────────────
+    if parsed.path == "/api/update/check":
+        from api.hot_update import check_updates
+        return j(handler, check_updates())
+
+    if parsed.path == "/api/update/pull":
+        from api.hot_update import pull_updates
+        return j(handler, pull_updates())
+
+    if parsed.path == "/api/update/restart-done":
+        from api.hot_update import clear_restart_sentinel
+        return j(handler, clear_restart_sentinel())
+
     # ── Providers (GET) ──
     if parsed.path == "/api/providers":
         return j(handler, get_providers())
