@@ -2125,6 +2125,10 @@ def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
     )
     if any(model.startswith(prefix) for prefix in prefixes):
         return list(VALID_REASONING_EFFORTS)
+    # Custom provider aliases (NewAPI/mirror) — default to showing reasoning
+    # since most modern models support it
+    if provider == "custom" or provider.startswith("custom:"):
+        return list(VALID_REASONING_EFFORTS)
     return []
 
 
