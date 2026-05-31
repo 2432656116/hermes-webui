@@ -3,6 +3,207 @@
 
 ## [Unreleased]
 
+## [v0.51.182] — 2026-05-31 — Release FB (stage-batchB2 — headless browser smoke gate + consolidated client-disconnect handling)
+
+### Added
+- CI now runs a headless browser smoke test (`tests/browser_smoke.py`, `.github/workflows/browser-smoke.yml`) on every PR and push: it boots the real server agent-free and loads the key pages in Chromium, failing on any console error or uncaught JS exception. This catches the runtime-JS brick class (e.g. a `const` reassigned at runtime as in #3162, or a `function`/`window` name collision as in #2715/#2771) that `node --check`, ESLint, and the mocked test suite cannot see because they only manifest when a real browser executes the page. The smoke is credential-free — it strips `*_API_KEY` from the environment and drives no real model (#3231).
+
+### Fixed
+- Client disconnects during response writes (browser tab close, SSE reconnect races, mobile network switches, half-closed sockets) are now handled through a single `_CLIENT_DISCONNECT_ERRORS` set and a `_safe_write` helper instead of ad-hoc per-call-site `try/except`, so an expected disconnect no longer surfaces as a misleading server 500 in the logs. The error-response path is itself wrapped so a disconnect while sending a 500 is swallowed quietly rather than cascading. A bare `TimeoutError` from the Joplin notes integration's `urlopen` is now converted to a clean "not reachable" error at the route rather than escaping to the dispatch-level disconnect handler (#3210).
+
+## [v0.51.181] — 2026-05-30 — Release FA (stage-batchA — agent-cache eviction teardown + streaming finalize race)
+
+### Fixed
+- Cached agents evicted after session-identity mismatches, unsafe runtime refresh, credential self-heal, or skipped compression migration now go through the normal session-boundary teardown path, committing pending memory and closing provider/session resources instead of silently dropping the cache entry (#3218, closes #3215).
+- Assistant streaming text is no longer lost when a stream completes while you have switched to a different session tab: the SSE `done` handler now sets the stream-finalized flag immediately (before the fade window), so a `stream_end` event arriving mid-fade can no longer trigger `_restoreSettledSession()` and overwrite the live messages with a stale server snapshot (#3201, closes #3195).
+
+## [v0.51.180] — 2026-05-30 — Release EZ (stage-batch62 — session/agent cache ownership hardening)
+
+### Fixed
+
+- Guard session and agent caches against compression/continuation id drift: `GET /api/session` now evicts a cached `Session` whose own `session_id` no longer matches the requested key (instead of trusting the LRU), the background title-update/refresh paths only adopt a cached session when its identity matches, and the compression checkpoint migration no longer re-stores a stale object under the old lineage id. Prevents a stale cached object from making `/api/session?session_id=<tip>` return an older transcript segment, which looked like a disappeared session (#3191).
+- Evicted cached agents are now torn down cleanly at the WebUI session boundary: pending session memory is committed first, and only if the lifecycle entry is clean afterward does the agent get unregistered and its memory provider shut down via `shutdown_memory_provider(messages)` (closing provider-owned clients such as Hindsight's aiohttp session) before the session DB is closed — instead of leaking those resources until garbage collection (#3166).
+
+## [v0.51.179] — 2026-05-30 — Release EY (stage-batch61 — custom-provider reasoning efforts + clearer sidebar tooltips)
+
+### Fixed
+
+- Reasoning effort selector now appears for thinking-capable models served through custom API aggregators (New API, One API, etc.) that use non-standard model naming — bare names like `deepseek-v4-flash` or dot-separated `moonshotai.kimi-k2.5` rather than the OpenRouter-style `vendor/model` slash format. The heuristic now also strips a dot-vendor prefix and recognizes a `thinking`/`reasoning` token anywhere in the model name; plain non-reasoning models stay hidden as before (#3202).
+- Sidebar session row tooltips now explain the fork, prior-turn, child-session, and running/unread status badges, and hovering a truncated chat title shows the full title instead of the old "Double-click to rename" hint (#3203). The localized pending-approval/clarify attention tooltip retains precedence over the generic running/unread state tooltip on the status dot, and the fork tooltip keeps its localized "Forked from" base.
+
+## [v0.51.178] — 2026-05-30 — Release EX (stage-batch60 — parallel sharded CI test runs)
+
+### Changed
+
+- CI: the test suite now runs in 3 parallel shards per Python version (9 jobs total) via `pytest-shard`, cutting wall-clock test time roughly in half (slowest shard ~70s vs ~180s sequential). To make sharding safe, several tests that asserted a pristine default while a sibling test mutated shared process/server state were fixed to establish their own preconditions: onboarding-completed flag reset (`test_onboarding_mvp`), password-hash cache invalidation (`test_issue693_system_health_panel`), authoritative sessions-file path (`test_auth_session_persistence`), and — the root cause of the worst leak — `test_profile_env_isolation` no longer deletes + re-imports `api.profiles` (which poisoned the module's cached base-home global for every later test); it now points the cached path via `monkeypatch.setattr`. A conftest fixture also restores `HERMES_HOME`/`HERMES_BASE_HOME` after each test as defense-in-depth. Completes the test-sharding half of #3197 (the Docker-cache half shipped in v0.51.177).
+
+## [v0.51.177] — 2026-05-30 — Release EW (stage-batch59 — Docker smoke-test layer caching)
+
+### Changed
+
+- CI: the Docker smoke-test workflow now builds the image once and caches its layers via the GitHub Actions cache (`type=gha`), then each compose variant restores from that cache instead of rebuilding from scratch — saving ~1-3 minutes per variant. The image is still built from the PR's local Dockerfile (`load: true`), so PR changes are tested, not the released image. (Partial adoption of #3197 — the Docker half; the test-sharding half is deferred pending test-suite shard-safety work.)
+
+## [v0.51.176] — 2026-05-30 — Release EV (stage-batch58 — sidebar attention indicators)
+
+### Added
+
+- Sidebar session rows now surface pending approval and clarify work with a color-coded status dot (red for approvals, amber for clarifies) plus a matching left rail and tinted background, so inactive conversations that need a permission decision or an answer are easy to spot at a glance. A distinct two-tone attention sound also plays for approval/clarify prompts, separate from the completion sound (#3190).
+
+## [v0.51.175] — 2026-05-30 — Release EU (stage-batch57 — internal conversation links)
+
+### Added
+
+- Internal conversation links: a "Copy conversation link" action copies a Markdown reference (`session://<id>`) for any conversation, and `session://` references render as same-origin in-app links that open the target conversation without a full page reload (#3179). Links are sanitized through the existing safe-URL allowlist (rewritten to `/session/<id>`, label escaped, sid URL-encoded — verified against quote-breakout and script-injection payloads).
+- Conversation filtering now recognizes pasted session references directly: raw session IDs, `session://...` references, `/session/...` URLs, and Markdown session links surface the target conversation while preserving normal content-search hits (#3179).
+
+## [v0.51.174] — 2026-05-30 — Release ET (stage-batch56 — CLI/gateway session usage in Insights)
+
+### Added
+
+- The Insights page now includes CLI and gateway sessions (Telegram, Discord, cron, TUI) from the Hermes agent's `state.db` in usage totals, model breakdown, and daily activity — not just WebUI-native sessions (#3189). WebUI sessions are de-duplicated so they are counted once, not double-counted against their `state.db` row.
+
+## [v0.51.173] — 2026-05-30 — Release ES (stage-batch55 — Windows path/journal safety + pin-quota snapshot fix + tool-card paging anchor + sidebar dedupe + quieter tool cards)
+
+### Fixed
+
+- Windows native runs now skip the POSIX-only turn-journal directory fsync instead of raising `AttributeError` for missing `os.O_DIRECTORY` on every submitted turn (#3170).
+- `/api/media` now treats Windows cross-drive `commonpath()` comparisons as non-matches instead of 500ing when media paths and allowed roots live on different drives (#3171).
+- Hidden pre-compression snapshots no longer keep stale pin state or count toward the visible pinned-session quota (#3181).
+- Tool-call cards stay anchored when scrolling back through paginated history; legacy session-level tool-call indices are rebased to the returned message window and the browser refreshes tool-call anchors whenever a larger history window is loaded (#3120).
+- Avoid duplicate sidebar rows when a compressed session completes after both the preserved snapshot id and continuation id are already present in the session list.
+
+### Changed
+
+- Restored the legacy compact tool-call card chrome by removing the persistent "Tool output" badge and returning the left rail to the muted border treatment. This keeps tool activity visually quieter while preserving the existing collapsible tool details.
+
+## [v0.51.172] — 2026-05-30 — Release ER (stage-batch54 — model-label fallback + dev cache-bust hash + tilde workspace completion + cron project-chip sessions)
+
+### Fixed
+
+- Session model labels now fall back to the friendly `getModelLabel()` form instead of the raw model id when gateway routing info is unavailable (#3174).
+- Dev-build cache-busting now includes a short hash of the tracked dirty diff, so local asset URLs change on each edit instead of staying at a constant `-dirty` suffix (#3159).
+- Workspace path autocomplete now preserves `~/` suggestions while browsing under the user's home directory (#3173).
+- CLI-sourced cron sessions that were squeezed past the default sidebar window now stay addressable under their project chip via a dedicated cron-only lookup pass (#3172).
+
+## [v0.51.171] — 2026-05-30 — Release EQ (stage-batch53 — tool-output card badge + Neon opt-in skin)
+
+### Added
+
+- Tool-call output cards now carry a persistent "Tool output" badge and accent rail so tool output stays visually distinct from final assistant responses without requiring hover (#2867).
+- New opt-in "Neon" cyberpunk skin (dark-first, purple/cyan accents). Default-off; select it from the skin list like Catppuccin or Nous.
+
+## [v0.51.170] — 2026-05-30 — Release EP (stage-batch52 — run-aware SSE replay cursors)
+
+### Fixed
+
+- SSE run-journal replay cursors are now run-aware: a stale `after_seq` from an interrupted prior stream can no longer suppress replay events in a newer stream whose sequence numbers reset from 1. The reconnect cursor now carries a run-scoped `after_event_id` (`run_id:seq`) and the server ignores it when the run id differs, falling back to same-run `after_seq` dedupe (#3124).
+
+## [v0.51.169] — 2026-05-30 — Release EO (stage-batch51 — skill-toggle profile scoping + update-tag filter + Docker docs)
+
+### Fixed
+
+- Docker docs now explain host-localhost URLs (`host.docker.internal` / `host.containers.internal`) and the `sudo docker compose` `$HOME=/root` bind-mount pitfall for users whose WebUI cannot reach host APIs or see `~/.hermes` (#3012, #3006).
+- Skills panel disabled/enabled state and toggle writes now resolve `config.yaml` from the active WebUI profile instead of the process default Hermes home or startup config override (#3066).
+- Update checks no longer advertise a newer release tag when a main-tracking checkout already contains that tag; the banner now falls through to the branch comparison path instead of offering an update that cannot fast-forward (#3140).
+
+## [v0.51.168] — 2026-05-30 — Release EN (stage-batch50 — hotfix: mobile "Failed to load conversation messages")
+
+### Fixed
+
+- Fixed a `TypeError` in `_ensureMessagesLoaded` that surfaced as a "Failed to load conversation messages" toast on mobile after most messages: a `const msgs` binding was reassigned by the #3018 ephemeral-field carry-forward (introduced v0.51.161), which throws at runtime. Changed to `let`. Mobile triggered it most because SSE/visibility events fire the session-reload path more aggressively (#3162).
+
+### Added
+
+- Static JS runtime-error lint guard (`eslint.runtime-guard.config.mjs` + `tests/test_static_js_runtime_lint.py`): a curated, zero-false-positive ESLint check (`no-const-assign`, `no-import-assign`) over `static/**/*.js` that catches the brick-class of runtime errors `node --check` and source-presence tests miss. Runs in the test suite when ESLint is present and skips gracefully otherwise. See `TESTING.md` > "Static JS runtime lint".
+
+## [v0.51.167] — 2026-05-30 — Release EM (stage-batch49 — iOS-style swipe actions for touch devices + session-list FLIP reflow)
+
+### Added
+
+- Touch devices now support iOS-mail-style swipe actions on session rows: swipe left to reveal a Delete action, swipe right to reveal Archive (Restore for already-archived sessions). Swipe is gated to touch/coarse-pointer input, so desktop click, context-menu, and drag behavior are unchanged. Delete still routes through the existing confirmation dialog. The session list also gains FLIP-based reflow animation when rows are archived, deleted, or reordered, honoring `prefers-reduced-motion`.
+
+## [v0.51.166] — 2026-05-30 — Release EL (stage-batch48 — shared OpenCode runtime key + cron project-chip sessions)
+
+### Fixed
+
+- OpenCode provider key lookup now honors the shared `OPENCODE_API_KEY` fallback for both Zen and Go runtime paths, matching model-picker detection when provider-specific keys are absent (#3145).
+- Agent-side cron sessions imported from state.db now remain available to their assigned project chip as `default_hidden` rows instead of being filtered out before project reveal logic can see them (#3134).
+
+## [v0.51.165] — 2026-05-30 — Release EK (stage-batch47 — stop EventSource reconnect storm on long-lived SSE streams)
+
+### Fixed
+
+- The session-events and gateway SSE streams no longer emit `Connection: close`, which browsers interpreted as a signal that the EventSource lifecycle had ended — triggering an instant reconnect loop that thrashed the session list roughly once per second and forced repeated re-renders / scroll-to-bottom (#3103, regression from the HTTP/1.1 keep-alive change in 598fd4ff). Finite responses that lack a `Content-Length` (e.g. the on-the-fly workspace ZIP download) keep `Connection: close` for unambiguous HTTP/1.1 message framing.
+
+## [v0.51.164] — 2026-05-30 — Release EJ (stage-batch46 — passive performance hardening: refresh coalescing + draft-save dedup + activity placeholders + bounded restart-safety wait)
+
+### Fixed
+
+- Coalesced duplicate in-flight sidebar/project refreshes and suppressed overlapping approval/clarify fallback polls, reducing repeated passive requests while preserving latest-refresh-wins sidebar state.
+- Skipped duplicate composer-draft writes when the normalized autosave payload is unchanged, avoiding redundant full session JSON rewrites during debounced input/focus churn.
+- Refined empty Activity waiting placeholders to distinguish stream creation, first-token wait, post-tool model wait, and running-tool wait states.
+- Self-update restart safety now checks active agent runs as well as open SSE streams and waits for in-flight work before re-exec, avoiding update-triggered interruption when a run outlives its browser stream. The wait is bounded (300s) with a logged fallback to re-exec so a long-running or stuck agent run cannot soft-jam the self-update indefinitely.
+- Documented the WebUI prefill context budget in README and architecture notes so operators can keep new-browser-turn startup context compact.
+
+## [v0.51.163] — 2026-05-30 — Release EI (stage-batch45 — session duplicate/branch field propagation)
+
+### Fixed
+
+- Duplicating or branching a session now carries over the fields that were previously dropped, so the copy behaves identically to the original until further edits: `truncation_watermark`, model-facing `context_messages` (deep-copied for independence), gateway routing + routing history, context-engine state, cache-token counters, composer draft, LLM-title flag, and per-session settings (model provider, project, personality, toolsets, context length, threshold). Compression anchors and last-prompt-token counts are intentionally not carried so the copy re-derives them. Prevents data-loss scenarios where, e.g., editing a message in a duplicated session would drop messages during state.db merge.
+
+## [v0.51.162] — 2026-05-30 — Release EH (stage-batch44 — conversation-filter clear button + code-only title-language regression coverage)
+
+### Added
+
+- Conversation filtering now shows a clear button inside the search field whenever text is present, letting users clear the filter with one click.
+
+## [v0.51.161] — 2026-05-29 — Release EG (stage-batch43 — 3-PR live-display fixes: jump-to-question on intermediate assistant messages + per-turn usage badge persistence + stale unread/compression-timer/tool-card dedup)
+
+### Fixed
+
+- The jump-to-question button now appears on every assistant message that has a resolvable question target, not only the turn-final one. Multi-step turns (tool call → assistant → tool call → assistant) previously stripped the navigation affordance from intermediate assistant bubbles.
+- Per-turn ephemeral fields (`_turnUsage`, `_turnDuration`, `_turnTps`, `_gatewayRouting`) are now carried forward when a session refresh replaces the in-memory message list with fresh server data, so the usage badge / duration / gateway-routing pill no longer flash and disappear after a compaction restore, external active-session poll, or SSE error recovery (#3018).
+- The sidebar unread dot no longer sticks on a session after it has been viewed: syncing the viewed count now clears any stale completion-unread marker, and an actively-viewed session syncs its count instead of being flagged unread on tab switch (#3020).
+- The auto-compression card's elapsed timer is now cleared on completion/error, so a replaced card is no longer treated as a still-running compression; a background-session completion no longer kills the active session's compression timer (#2973).
+- Tool cards no longer duplicate the result text in both the header and the detail row: the completed tool result is routed to the detail snippet (falling back to the header only when no progress text was streamed), and the detail row is suppressed when the snippet equals the header preview.
+
+## [v0.51.160] — 2026-05-29 — Release EF (stage-batch42 — 3-PR low-risk cleanup: OpenCode shared-key detection + skills-panel profile-aware disabled read + session-index metadata refresh perf)
+
+### Fixed
+
+- Detect a shared `OPENCODE_API_KEY` as enabling both OpenCode Zen and OpenCode Go provider groups, matching Hermes Agent bridge environments that expose one OpenCode credential.
+- The skills panel now reads each skill's disabled state from the active WebUI profile's `config.yaml` (checking `skills.platform_disabled.webui` then falling back to `skills.disabled`) instead of the process-global `HERMES_HOME`, so non-default profiles show the correct enabled/disabled state and stay consistent with the skill-toggle write path.
+
+### Changed
+
+- WebUI session-sidebar metadata refresh is faster on large session directories: the persisted session-id listing is cached by directory mtime instead of re-globbing under the sessions lock on every `/api/sessions` poll, metadata-only loads skip the per-row session-index read when the sidecar already carries an authoritative `message_count`, and only runtime/lineage-shaped rows are overlaid with fuller sidecar metadata (historical transcripts are no longer scanned on every refresh).
+
+## [v0.51.159] — 2026-05-29 — Release EE (stage-batch41 — 5-PR low-risk cleanup: Gateway tool-progress forwarding + shutdown diagnostics + CLI snippet-limit parity + numpad-Enter submit + sync-chat notes guardrail)
+
+### Changed
+
+- WebUI's durable-notes guardrail now also applies to sync chat and explicitly asks agents to leave external notes and durable memory unchanged unless a turn contains an explicit capture or reusable durable signal; durable note writes should be summarized back to the user.
+
+### Fixed
+
+- Gateway-backed browser chat now forwards Hermes Gateway `hermes.tool.progress` SSE events into WebUI's live tool/activity stream, so Gateway runs no longer appear idle while server-side tools are running.
+- WebUI now logs structured shutdown diagnostics when the server exits or `/api/shutdown` is called, including active stream IDs to help diagnose interrupted turns after restarts.
+- The chat composer now treats the numeric keypad Enter key as a submit shortcut even when the send-key preference is set to Ctrl/Cmd+Enter, while preserving regular Enter-as-newline behavior in that mode.
+- The CLI tool-result snippet limit in the browser now matches the backend (`_TOOL_RESULT_SNIPPET_MAX = 4000`), so longer non-diff CLI tool output is no longer truncated to 200 characters before reaching the tool card.
+
+## [v0.51.158] — 2026-05-29 — Release ED (stage-batch40 — 5-PR low-risk cleanup: numpad/keyboard composer fixes + Joplin search auth + provider-qualified model preservation + SSE fallback poll throttle + assistant-reply polish)
+
+### Changed
+
+- WebUI chat instructions now explicitly prevent terse scratchpad/planning fragments from appearing in visible assistant replies, while still allowing clear user-facing progress updates during tool-heavy work.
+
+### Fixed
+
+- The chat composer no longer forces mobile newline-on-Enter behavior on touch-primary devices that also have a fine pointer present (tablet plus Bluetooth keyboard, detachable Surface, iPad plus Magic Keyboard), so Enter submits with desktop semantics when a real keyboard is in the picture.
+- The active-session external-refresh fallback poll now fires every 30 s instead of every 5 s. The SSE session-events stream already pushes invalidations in real time, so the poll is only a fallback; the slower interval removes visible scroll jitter and a network/CPU floor on long sessions.
+- The model picker no longer fuzzy-matches a provider-qualified model id (`@provider:model` or slash-qualified `vendor/model`) to a nearby curated sibling once exact lookup fails, preserving the raw typed value so uncatalogued models stay routable instead of silently snapping to a different model.
+- Joplin notes search now keeps the `Authorization` header and adds a query-token compatibility shim only for Web Clipper `/search` calls, covering clipper builds that return HTTP 403 for header-only search auth while keeping other Joplin API URLs token-free.
+
 ## [v0.51.157] — 2026-05-28 — Release EC (stage-batch39 — 5-PR mixed-risk cleanup: gateway prefill forward + prefill budget + compressed-continuation sidebar + browser-transcript memory guidance + reasoning max parity)
 
 ### Added

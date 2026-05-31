@@ -2131,6 +2131,32 @@ def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
     )
     if any(model.startswith(prefix) for prefix in prefixes):
         return list(VALID_REASONING_EFFORTS)
+    # Custom API aggregators (e.g. New API, One API) use non-standard model naming:
+    # bare names like "deepseek-v4-flash" or dot-separated "moonshotai.kimi-k2.5"
+    # rather than the OpenRouter-style "vendor/model" that the prefix list targets.
+    # Strip a dot-vendor prefix (e.g. "moonshotai.kimi-k2.5" → "kimi-k2.5") and
+    # check both the original bare name and the stripped suffix.
+    bare_after_dot = bare.split(".", 1)[-1] if "." in bare else bare
+    thinking_bare_prefixes = (
+        "deepseek-v4",
+        "deepseek-r1",
+        "deepseek-r2",
+        "kimi-k2",
+        "kimi-thinking",
+        "qwen3",
+        "claude-3",
+        "claude-4",
+        "o1-",
+        "o3-",
+        "o4-",
+    )
+    if any(
+        bare.startswith(p) or bare_after_dot.startswith(p)
+        for p in thinking_bare_prefixes
+    ):
+        return list(VALID_REASONING_EFFORTS)
+    if "thinking" in bare or "reasoning" in bare:
+        return list(VALID_REASONING_EFFORTS)
     return []
 
 
@@ -3437,6 +3463,7 @@ def get_available_models() -> dict:
                 "XIAOMI_API_KEY",
                 "OPENCODE_ZEN_API_KEY",
                 "OPENCODE_GO_API_KEY",
+                "OPENCODE_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
                 "XAI_API_KEY",
@@ -3478,9 +3505,9 @@ def get_available_models() -> dict:
                 detected_providers.add("x-ai")
             if all_env.get("MISTRAL_API_KEY"):
                 detected_providers.add("mistralai")
-            if all_env.get("OPENCODE_ZEN_API_KEY"):
+            if all_env.get("OPENCODE_ZEN_API_KEY") or all_env.get("OPENCODE_API_KEY"):
                 detected_providers.add("opencode-zen")
-            if all_env.get("OPENCODE_GO_API_KEY"):
+            if all_env.get("OPENCODE_GO_API_KEY") or all_env.get("OPENCODE_API_KEY"):
                 detected_providers.add("opencode-go")
             # AWS Bedrock uses IAM credentials rather than a single API key.
             # Detect when both access key and secret are available (#2720).
