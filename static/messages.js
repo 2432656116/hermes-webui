@@ -1972,7 +1972,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(!S.messages.some(m=>m.role==='assistant'&&String(m.content||'').trim())&&!assistantText){removeThinking();S.messages.push({role:'assistant',content:'**No response received.** Check your API key and model selection.'});}
           if(_markerOnlyAssistantError&&typeof showToast==='function') showToast('No response received after context compression. Please retry.',5000,'error');
           if(isSessionViewed) _markSessionViewed(completedSid, completedSession.message_count ?? S.messages.length);
-          syncTopbar();renderMessages({preserveScroll:true});
+          syncTopbar();renderMessages(shouldFollowOnDone?{}:{preserveScroll:true});
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
           loadDir('.');
           // TTS auto-read: speak the last assistant response if enabled (#499)
