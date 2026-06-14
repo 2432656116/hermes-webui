@@ -7,6 +7,7 @@ PID_FILE="${HERMES_WEBUI_PID_FILE:-${HERMES_HOME}/webui.pid}"
 LOG_FILE="${HERMES_WEBUI_LOG_FILE:-${HERMES_HOME}/webui.log}"
 STATE_FILE="${HERMES_WEBUI_CTL_STATE_FILE:-${HERMES_HOME}/webui.ctl.env}"
 DEFAULT_STATE_DIR="${HERMES_WEBUI_STATE_DIR:-${HERMES_HOME}/webui}"
+DEFAULT_LAUNCHD_LABEL="${HERMES_WEBUI_LAUNCHD_LABEL:-com.parantoux.hermes-webui}"
 
 usage() {
   cat <<'EOF'
@@ -27,6 +28,7 @@ ensure_home() {
 }
 
 _load_repo_dotenv_preserving_env() {
+  [[ "${HERMES_WEBUI_NO_DOTENV:-0}" == "1" ]] && return 0
   local env_file="${REPO_ROOT}/.env"
   [[ -f "${env_file}" ]] || return 0
 
@@ -163,21 +165,96 @@ _is_alive() {
   kill -0 "${pid}" >/dev/null 2>&1
 }
 
-_proc_args() {
+_is_windows_bash() {
+  [[ "${OS:-}" == "Windows_NT" ]] && return 0
+  case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_windows_bash_path() {
+  local path="${1//\\//}" drive rest
+  if [[ "${path}" =~ ^([A-Za-z]):(.*)$ ]]; then
+    drive="${BASH_REMATCH[1],,}"
+    rest="${BASH_REMATCH[2]}"
+    printf '/%s%s\n' "${drive}" "${rest}"
+    return
+  fi
+  printf '%s\n' "${path}"
+}
+
+_windows_pid_for_bash_pid() {
   local pid="$1"
-  ps -p "${pid}" -o args= 2>/dev/null || true
+  ps -p "${pid}" -l 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+_stop_webui_pid() {
+  local pid="$1" signal="${2:-TERM}"
+  if _is_windows_bash && command -v taskkill >/dev/null 2>&1; then
+    local winpid
+    winpid="$(_windows_pid_for_bash_pid "${pid}")"
+    if [[ "${winpid}" =~ ^[0-9]+$ ]]; then
+      taskkill //F //T //PID "${winpid}" >/dev/null 2>&1 || true
+      return
+    fi
+  fi
+  if [[ "${signal}" == "KILL" ]]; then
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+  else
+    kill "${pid}" >/dev/null 2>&1 || true
+  fi
+}
+
+_proc_args() {
+  local pid="$1" args
+  args="$(ps -p "${pid}" -o args= 2>/dev/null || true)"
+  if [[ -n "${args}" ]]; then
+    printf '%s\n' "${args}"
+    return
+  fi
+  if _is_windows_bash; then
+    local winpid
+    winpid="$(_windows_pid_for_bash_pid "${pid}")"
+    if [[ "${winpid}" =~ ^[0-9]+$ ]] && command -v wmic >/dev/null 2>&1; then
+      args="$(wmic process where "ProcessId=${winpid}" get CommandLine //value 2>/dev/null | sed -n 's/^CommandLine=//p' | tr -d '\r')"
+      if [[ -n "${args}" ]]; then
+        printf '%s\n' "${args}"
+        return
+      fi
+    fi
+    ps -p "${pid}" -f 2>/dev/null | awk 'NR == 2 { for (i = 8; i <= NF; i++) printf "%s%s", (i == 8 ? "" : " "), $i; print "" }'
+  fi
 }
 
 _is_owned_webui_pid() {
-  local pid="$1" args state_repo="" state_python=""
+  local pid="$1" args args_slash state_repo="" state_repo_slash="" state_repo_win="" state_repo_win_slash="" state_python="" state_python_slash="" state_python_bash=""
   [[ -f "${STATE_FILE}" ]] || return 1
   _load_state_if_present
   state_repo="${REPO_ROOT:-}"
   state_python="${PYTHON_EXE:-}"
+  state_repo_slash="${state_repo//\\//}"
+  state_python_slash="${state_python//\\//}"
+  if _is_windows_bash; then
+    state_repo_win="$(cygpath -w "${state_repo}" 2>/dev/null || true)"
+    state_repo_win_slash="${state_repo_win//\\//}"
+  fi
+  if [[ -n "${state_python}" ]] && _is_windows_bash; then
+    state_python_bash="$(_windows_bash_path "${state_python}")"
+  fi
   [[ "${state_repo}" == "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" ]] || return 1
   args="$(_proc_args "${pid}")"
   [[ -n "${args}" ]] || return 1
-  [[ "${args}" == *"${state_repo}/bootstrap.py"* || "${args}" == *"${state_repo}/server.py"* || "${args}" == *"${state_repo}/start.sh"* || ( -n "${state_python}" && "${args}" == *"${state_python}"* ) ]]
+  args_slash="${args//\\//}"
+  [[ "${args_slash}" == *"${state_repo_slash}/bootstrap.py"* ||
+     "${args_slash}" == *"${state_repo_slash}/server.py"* ||
+     "${args_slash}" == *"${state_repo_slash}/start.sh"* ||
+     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/bootstrap.py"* ) ||
+     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/server.py"* ) ||
+     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/start.sh"* ) ||
+     ( -n "${state_python}" && "${args}" == *"${state_python}"* ) ||
+     ( -n "${state_python_slash}" && "${args_slash}" == *"${state_python_slash}"* ) ||
+     ( -n "${state_python_bash}" && "${args_slash}" == *"${state_python_bash}"* ) ]]
 }
 
 _current_pid() {
@@ -197,6 +274,53 @@ _clear_stale_pid() {
   fi
 }
 
+_pid_listens_on_port() {
+  # Best-effort check that PID $1 has a listening socket on TCP port $2.
+  # macOS (where launchd exists) ships lsof; if we can't determine ownership we
+  # return 2 ("unknown") so the caller can fall back conservatively rather than
+  # guess. Never blocks on a hard failure.
+  local pid="$1" port="$2"
+  [[ "${pid}" =~ ^[0-9]+$ && "${port}" =~ ^[0-9]+$ ]] || return 2
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -nP -p "${pid}" -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+      return 0   # PID is listening on that port → real conflict
+    fi
+    return 1     # PID is alive but NOT listening on that port → no conflict
+  fi
+  return 2       # can't determine
+}
+
+_launchd_webui_pid() {
+  [[ "${HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT:-0}" == "1" ]] && return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  local label="${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}}"
+  [[ -n "${label}" ]] || return 1
+  local uid launchd_out pid
+  uid="$(id -u)"
+  launchd_out="$(launchctl print "gui/${uid}/${label}" 2>/dev/null)" || return 1
+  pid="$(printf '%s\n' "${launchd_out}" | awk '/^[[:space:]]*pid = / {print $3; exit}')"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  (( pid > 0 )) || return 1
+  _is_alive "${pid}" || return 1
+  # Only treat the launchd job as a conflict for the port we are about to bind.
+  # A second instance on a DIFFERENT port (e.g. HERMES_WEBUI_PORT=8788 for a
+  # test build) does not collide with the launchd-managed default and must be
+  # allowed to start (#3291 over-block fix). When port ownership can't be
+  # determined (no lsof), fall back to the conservative previous behavior of
+  # only guarding the default port so non-default ports are never wrongly blocked.
+  local want_port="${CTL_PORT:-${HERMES_WEBUI_PORT:-8787}}"
+  _pid_listens_on_port "${pid}" "${want_port}"
+  case "$?" in
+    0) printf '%s\n' "${pid}"; return 0 ;;   # launchd job listens on our port → block
+    1) return 1 ;;                            # launchd job on a different port → allow
+    *)                                        # unknown: only guard the default port
+      if [[ "${want_port}" == "8787" ]]; then
+        printf '%s\n' "${pid}"; return 0
+      fi
+      return 1 ;;
+  esac
+}
+
 start_cmd() {
   ensure_home
   _load_repo_dotenv_preserving_env
@@ -211,6 +335,12 @@ start_cmd() {
   if existing_pid="$(_current_pid 2>/dev/null)"; then
     echo "[ctl] Hermes WebUI is already running (PID ${existing_pid})"
     return 0
+  fi
+  local launchd_pid
+  if launchd_pid="$(_launchd_webui_pid 2>/dev/null)"; then
+    echo "[ctl] Refusing to start a second Hermes WebUI while launchd job ${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}} is running (PID ${launchd_pid})." >&2
+    echo "[ctl] Use launchctl kickstart -k gui/$(id -u)/${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}} or disable the launchd job before using ctl.sh start." >&2
+    return 2
   fi
   _clear_stale_pid >/dev/null 2>&1 || true
 
@@ -253,7 +383,7 @@ stop_cmd() {
   fi
 
   echo "[ctl] Stopping Hermes WebUI (PID ${pid})"
-  kill "${pid}" >/dev/null 2>&1 || true
+  _stop_webui_pid "${pid}" TERM
   local i
   for i in {1..50}; do
     if ! _is_alive "${pid}"; then
@@ -265,7 +395,7 @@ stop_cmd() {
   done
 
   echo "[ctl] Process did not exit after SIGTERM; sending SIGKILL" >&2
-  kill -KILL "${pid}" >/dev/null 2>&1 || true
+  _stop_webui_pid "${pid}" KILL
   rm -f "${PID_FILE}" "${STATE_FILE}"
 }
 

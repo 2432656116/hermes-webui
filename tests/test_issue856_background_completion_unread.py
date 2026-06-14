@@ -314,7 +314,7 @@ def test_hidden_active_done_still_updates_current_pane_but_not_read_state():
     active_guard_idx = done_block.find("if(isActiveSession){", viewed_const_idx)
     session_update_idx = done_block.find("S.session=d.session", active_guard_idx)
     render_idx = done_block.find("renderMessages(", active_guard_idx)
-    load_dir_idx = done_block.find("loadDir('.')", active_guard_idx)
+    load_dir_idx = done_block.find("preservePreview", active_guard_idx)
     mark_viewed_idx = done_block.find("if(isSessionViewed) _markSessionViewed(completedSid", active_guard_idx)
 
     assert active_const_idx != -1, "done handler must compute active/current pane separately"
@@ -363,7 +363,7 @@ def test_switching_away_counts_as_background_completion():
 
 
 def test_restore_settled_background_stream_marks_completion_unread():
-    restore_idx = MESSAGES_JS.find("async function _restoreSettledSession(source)")
+    restore_idx = MESSAGES_JS.find("async function _restoreSettledSession(source")
     assert restore_idx != -1, "_restoreSettledSession(source) not found"
     restore_block = MESSAGES_JS[restore_idx:MESSAGES_JS.find("function _handleStreamError", restore_idx)]
 
