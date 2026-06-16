@@ -1020,11 +1020,11 @@ async function saveDashboardSettings(){
     const saved=await api('/api/dashboard/config',{method:'POST',body:JSON.stringify(payload)});
     if(modeEl) modeEl.value=saved.enabled||'auto';
     if(urlEl) urlEl.value=saved.url||'';
-    if(statusEl) statusEl.textContent='Dashboard link settings saved.';
+    if(statusEl) statusEl.textContent=t('dashboard_settings_saved');
     await refreshDashboardStatus(true);
   }catch(err){
-    if(statusEl) statusEl.textContent='Dashboard link settings failed to save.';
-    else if(typeof showToast==='function') showToast('Dashboard link settings failed to save.');
+    if(statusEl) statusEl.textContent=t('dashboard_settings_failed');
+    else if(typeof showToast==='function') showToast(t('dashboard_settings_failed'));
   }
 }
 function openHermesDashboard(event){
@@ -2746,7 +2746,7 @@ document.addEventListener('click',function(e){
           _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
           showToast('🧠 Reasoning effort set to '+((st&&st.reasoning_effort)||effort));
         })
-        .catch(function(){showToast('🧠 Failed to set effort');});
+        .catch(function(){showToast(t('reason_effort_failed'));});
       closeReasoningDropdown();
     }
   }
@@ -6310,7 +6310,7 @@ function _showAgentHealthAlert(payload){
   const title=$('agentHealthTitle');
   const details=$('agentHealthDetails');
   if(!banner) return;
-  if(title) title.textContent='Hermes agent is not responding';
+  if(title) title.textContent=t('agent_not_responding');
   const state=payload&&payload.details&&payload.details.gateway_state?` State: ${payload.details.gateway_state}.`:'';
   if(details) details.textContent=`Gateway heartbeat failed.${state} Messages may not be delivered until it comes back.`;
   banner.hidden=false;
@@ -6376,7 +6376,7 @@ async function refreshSession() {
     S.activeStreamId=data.session.active_stream_id||null;
 
     syncTopbar(); _renderMessagesWithScrollSnapshot();
-    showToast('Conversation refreshed');
+    showToast(t('conversation_refreshed'));
   } catch(e) { setStatus('Refresh failed: ' + e.message); }
 }
 // ── Update banner ──
@@ -6526,7 +6526,7 @@ function _renderUpdateSummaryPanel(payload,data,targetKey){
       });
       if(!ul.children.length){
         const li=document.createElement('li');
-        li.textContent='No summary details available.';
+        li.textContent=t('no_summary_details');
         ul.appendChild(li);
       }
       block.appendChild(ul);
@@ -6769,23 +6769,23 @@ async function forceUpdate(btn){
     focusCancel:true,
   });
   if(!confirmed) return;
-  btn.disabled=true;btn.textContent='Force updating\u2026';
+  btn.disabled=true;btn.textContent=t('force_updating');
   const errEl=$('updateError');
   if(errEl){errEl.style.display='none';}
   try{
     const baselineServerIdentity = await _readHealthServerIdentity();
     const res=await api('/api/updates/force',{method:'POST',body:JSON.stringify({target}),timeoutMs:120000});
     if(!res.ok){
-      if(errEl){errEl.textContent='Force update failed: '+(res.message||'unknown error');errEl.style.display='block';}
+      if(errEl){errEl.textContent=t('force_update_failed')+(res.message||'unknown error');errEl.style.display='block';}
       btn.disabled=false;btn.textContent='Force update';
       return;
     }
-    showToast('Force update applied — restarting…');
+    showToast(t('force_update_applied'));
     sessionStorage.removeItem('hermes-update-checked');
     sessionStorage.removeItem('hermes-update-dismissed');
     _waitForServerThenReload({baselineServerIdentity});
   }catch(e){
-    if(errEl){errEl.textContent='Force update failed: '+e.message;errEl.style.display='block';}
+    if(errEl){errEl.textContent=t('force_update_failed')+e.message;errEl.style.display='block';}
     btn.disabled=false;btn.textContent='Force update';
   }
 }

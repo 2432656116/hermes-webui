@@ -5379,7 +5379,7 @@ function _renderProfileConceptHelp(activeName){
   const body = $('profileDetailBody');
   const empty = $('profileDetailEmpty');
   if (!title || !body) return;
-  title.textContent = 'Profiles vs workspaces';
+  title.textContent = t('profiles_vs_workspaces');
   body.innerHTML = `
     <div class="main-view-content">
       <div class="detail-card">
@@ -7856,7 +7856,7 @@ async function loadPasskeys(){
     return;
   }
   if(!window.PublicKeyCredential||!navigator.credentials){
-    list.textContent='Passkeys are not supported by this browser/context.';
+    list.textContent=t('passkeys_not_supported');
     const btn=$('btnRegisterPasskey'); if(btn) btn.disabled=true;
     return;
   }
@@ -7867,13 +7867,13 @@ async function loadPasskeys(){
       return;
     }
     const creds=(data&&data.credentials)||[];
-    if(!creds.length){list.textContent='No passkeys registered.';return;}
+    if(!creds.length){list.textContent=t('no_passkeys');return;}
     list.innerHTML=creds.map(c=>`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid var(--border);border-radius:8px;padding:8px;margin-top:6px"><span>${esc(c.label||'Passkey')}</span><button class="btn-tiny" onclick="deletePasskey('${esc(c.id)}')">Remove</button></div>`).join('');
-  }catch(e){list.textContent='Failed to load passkeys: '+e.message;}
+  }catch(e){list.textContent=t('passkey_load_failed')+e.message;}
 }
 
 async function registerPasskey(){
-  if(!window.PublicKeyCredential||!navigator.credentials){showToast('Passkeys require a supported browser and secure context.');return;}
+  if(!window.PublicKeyCredential||!navigator.credentials){showToast(t('passkeys_browser_unsupported'));return;}
   const label='This device';
   try{
     const optData=await api('/api/auth/passkey/register/options',{method:'POST',body:'{}'});
@@ -7887,7 +7887,7 @@ async function registerPasskey(){
       id:cred.id,rawId:_bytesToB64u(cred.rawId),type:cred.type,label,
       response:{clientDataJSON:_bytesToB64u(cred.response.clientDataJSON),attestationObject:_bytesToB64u(cred.response.attestationObject)}
     })});
-    showToast('Passkey registered');
+    showToast(t('passkey_registered'));
     loadPasskeys();
     try{_syncPasswordlessButton(await api('/api/auth/status'));}catch(_e){}
   }catch(e){showToast('Passkey registration failed: '+e.message);}
@@ -7896,7 +7896,7 @@ async function registerPasskey(){
 async function deletePasskey(id){
   const ok=await showConfirmDialog({title:'Remove passkey?',message:'This browser/device will no longer be able to sign in with that passkey.',confirmLabel:'Remove',danger:true,focusCancel:true});
   if(!ok) return;
-  try{await api('/api/auth/passkey/delete',{method:'POST',body:JSON.stringify({id})});showToast('Passkey removed');loadPasskeys();try{_syncPasswordlessButton(await api('/api/auth/status'));}catch(_e){}}
+  try{await api('/api/auth/passkey/delete',{method:'POST',body:JSON.stringify({id})});showToast(t('passkey_removed'));loadPasskeys();try{_syncPasswordlessButton(await api('/api/auth/status'));}catch(_e){}}
   catch(e){showToast('Failed to remove passkey: '+e.message);}
 }
 
@@ -8033,7 +8033,7 @@ async function syncFromUpstream(){
         status.style.color='var(--success)';
       }
       if(data.restart_scheduled){
-        showToast('Restarting to apply updates...');
+        showToast(t('restarting_updates'));
         setTimeout(()=>location.reload(),2500);
       }
     } else {
@@ -8510,7 +8510,7 @@ async function saveSettings(andClose){
           await api('/api/default-model',{method:'POST',body:JSON.stringify({model})});
           body.default_model=model;
         }catch(_modelErr){
-          if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
+          if(typeof showToast==='function') showToast(t('default_model_update_failed'));
         }
       }
       _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
@@ -8529,7 +8529,7 @@ async function saveSettings(andClose){
         await api('/api/default-model',{method:'POST',body:JSON.stringify({model})});
         body.default_model=model;
       }catch(_modelErr){
-        if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
+        if(typeof showToast==='function') showToast(t('default_model_update_failed'));
       }
     }
     _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
@@ -8557,7 +8557,7 @@ async function goPasswordless(){
   if(!ok) return;
   try{
     const saved=await api('/api/settings',{method:'POST',body:JSON.stringify({_passwordless:true})});
-    showToast('Password removed. Passkey sign-in remains enabled.');
+    showToast(t('password_removed'));
     _setSettingsAuthButtonsVisible(!!saved.auth_enabled);
     _syncPasswordlessButton({auth_enabled:saved.auth_enabled,password_auth_enabled:false,passkeys_count:1});
     const pwField=$('settingsPassword'); if(pwField) pwField.value='';

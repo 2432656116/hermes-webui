@@ -2889,7 +2889,7 @@ function _showBatchProjectPicker(){
   const none=document.createElement('div');none.className='project-picker-item';none.textContent='No project';
   none.onclick=async()=>{picker.remove();
     try{await Promise.all(ids.map(sid=>api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:sid,project_id:null})})));
-      showToast('Removed from project');exitSessionSelectMode();await renderSessionList();
+      showToast(t('project_removed'));exitSessionSelectMode();await renderSessionList();
     }catch(e){showToast('Move failed: '+(e.message||e));}
   };picker.appendChild(none);
   for(const p of(_allProjects||[])){
@@ -5284,7 +5284,7 @@ function renderSessionListFromCache(){
   } else if(_showAllProfiles){
     const pfToggle=document.createElement('div');
     pfToggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
-    pfToggle.textContent='Show active profile only';
+    pfToggle.textContent=t('show_active_profile_only');
     pfToggle.onclick=()=>{_showAllProfiles=false;renderSessionList();};
     list.appendChild(pfToggle);
   }
@@ -6544,7 +6544,7 @@ async function deleteSession(sid, beforeDelete=null){
       await loadSession(remaining.sessions[0].session_id);
     }else{
       const _tt=$('topbarTitle');if(_tt)_tt.textContent=assistantDisplayName();
-      const _tm=$('topbarMeta');if(_tm)_tm.textContent='Start a new conversation';
+      const _tm=$('topbarMeta');if(_tm)_tm.textContent=t('start_new_conversation');
       $('msgInner').innerHTML='';
       $('emptyState').style.display='';
       $('fileTree').innerHTML='';
@@ -6583,7 +6583,7 @@ function _showProjectPicker(session, anchorEl){
       const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
       if(idx>=0) _allSessions[idx].project_id=null;
       renderSessionListFromCache();
-      showToast('Removed from project');
+      showToast(t('project_removed'));
     } catch(e) {
       showToast('Unassign failed: '+(e.message||e));
     }
@@ -6726,7 +6726,7 @@ function _startProjectCreate(bar, addBtn){
         return;
       }
       await renderSessionList();
-      showToast('Project created');
+      showToast(t('project_created'));
     }else{
       inp.replaceWith(addBtn);
     }
@@ -6758,7 +6758,7 @@ function _startProjectRename(proj, chip){
       try {
         await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:inp.value.trim()})});
         await renderSessionList();
-        showToast('Project renamed');
+        showToast(t('project_renamed'));
       } catch(e) {
         _finishDone=false;
         showToast('Rename failed: '+(e.message||e));
@@ -6816,7 +6816,7 @@ function _showProjectContextMenu(e, proj, chip){
       try {
         await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:proj.name,color:hex})});
         await renderSessionList();
-        showToast('Color updated');
+        showToast(t('project_color_updated'));
       } catch(e) {
         showToast('Color update failed: '+(e.message||e));
       }
@@ -6853,7 +6853,7 @@ async function _confirmDeleteProject(proj){
     await api('/api/projects/delete',{method:'POST',body:JSON.stringify({project_id:proj.project_id})});
     if(_activeProject===proj.project_id) _activeProject=null;
     await renderSessionList();
-    showToast('Project deleted');
+    showToast(t('project_deleted'));
   } catch(e) {
     showToast('Delete failed: '+(e.message||e));
   }
