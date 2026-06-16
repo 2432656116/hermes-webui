@@ -1352,14 +1352,15 @@ $('msg').addEventListener('input',()=>{
     _saveComposerDraft(sid, $('msg').value, S.pendingFiles ? [...S.pendingFiles] : []);
   }
   const text=$('msg').value;
-  if(text.startsWith('/')&&text.indexOf('\n')===-1){
+  const _slashIdx=typeof _activeSlashCommandOffset==='function'?_activeSlashCommandOffset(text):-1;
+  if(_slashIdx>=0&&text.indexOf('\n')===-1){
     if(typeof getSlashAutocompleteMatches==='function'){
       getSlashAutocompleteMatches(text).then(matches=>{
         if(($('msg').value||'')!==text) return;
         if(matches.length)showCmdDropdown(matches); else hideCmdDropdown();
       });
     }else{
-      const prefix=text.slice(1);
+      const prefix=text.slice(_slashIdx+1);
       const matches=getMatchingCommands(prefix);
       if(matches.length)showCmdDropdown(matches); else hideCmdDropdown();
     }
@@ -1424,7 +1425,7 @@ $('msg').addEventListener('keydown',e=>{
     if(e.key==='ArrowUp'){e.preventDefault();navigateCmdDropdown(-1);return;}
     if(e.key==='ArrowDown'){e.preventDefault();navigateCmdDropdown(1);return;}
     if(e.key==='Tab'){e.preventDefault();selectCmdDropdownItem();return;}
-    if(e.key==='Escape'){e.preventDefault();hideCmdDropdown();return;}
+    if(e.key==='Escape'){e.preventDefault();e.stopPropagation();hideCmdDropdown();return;}
     if(e.key==='Enter'&&!e.shiftKey){
       if(_isImeEnter(e)){return;}
       e.preventDefault();
@@ -1519,6 +1520,12 @@ document.addEventListener('keydown',async e=>{
     if(editArea){
       const bar=editArea.closest('.msg-row')&&editArea.closest('.msg-row').querySelector('.msg-edit-bar');
       if(bar){const cancel=bar.querySelector('.msg-edit-cancel');if(cancel)cancel.click();}
+    }
+    // Blur composer to enable j/k message navigation.
+    // Skip while an IME candidate window is composing — Escape there should
+    // dismiss the candidate, not blur the composer (CJK input).
+    if(document.activeElement===$('msg') && !e.isComposing && !_imeComposing){
+      $('msg').blur();
     }
   }
 });
@@ -1847,7 +1854,7 @@ function applyBotName(){
     applyEmptyStateSuggestionPref();
     window._showTps=!!s.show_tps;
     window._fadeTextEffect=!!s.fade_text_effect;
-    window._showCliSessions=!!s.show_cli_sessions;
+    window._showCliSessions=s.show_cli_sessions!==false;
     window._showPreviousMessagingSessions=!!s.show_previous_messaging_sessions;
     window._soundEnabled=!!s.sound_enabled;
     window._notificationsEnabled=!!s.notifications_enabled;
@@ -1862,6 +1869,8 @@ function applyBotName(){
         ? s.worklog_details_expanded_default
         : s.activity_feed_expanded_default
     );
+    window._workspaceTodosTab=!!s.workspace_todos_tab;
+    if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
     window._sidebarDensity=(s.sidebar_density==='detailed'?'detailed':'compact');
     window._pinnedSessionsLimit=parseInt(s.pinned_sessions_limit||3,10)||3;
     window._inflightStateLimits={
@@ -1956,7 +1965,7 @@ function applyBotName(){
     applyEmptyStateSuggestionPref();
     window._showTps=false;
     window._fadeTextEffect=false;
-    window._showCliSessions=false;
+    window._showCliSessions=true;  // settings-load failed: mirror the True config default (#3988)
     window._soundEnabled=false;
     window._notificationsEnabled=false;
     window._whatsNewSummaryEnabled=false;
@@ -1965,6 +1974,8 @@ function applyBotName(){
     window._chatActivityDisplayMode='compact_worklog';
     window._transparentStream=false;
     window._terminalAutoExpandOnOutput=false;
+    window._workspaceTodosTab=false;
+    if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
     window._sessionJumpButtonsEnabled=false;
     window._sidebarDensity='compact';
     window._pinnedSessionsLimit=3;

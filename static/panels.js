@@ -1109,7 +1109,7 @@ async function _populateCronFormModelSelect(selectedModel, selectedProvider, dis
       const og = document.createElement('optgroup');
       og.label = g.provider || g.provider_id || 'Configured';
       if (g.provider_id) og.dataset.provider = g.provider_id;
-      for (const m of (Array.isArray(g.models) ? g.models : [])) {
+      for (const m of [...(Array.isArray(g.models) ? g.models : []), ...(Array.isArray(g.extra_models) ? g.extra_models : [])]) {
         if (!m || !m.id) continue;
         const opt = document.createElement('option');
         opt.value = m.id;
@@ -3441,6 +3441,30 @@ async function copyLogsAll() {
 }
 
 // ── Insights panel ──
+const STATIC_MODEL_HEALTH_ROWS = [
+  {id:'openai/gpt-5.4-mini', provider:'OpenAI', inputCostPerM:0.25, outputCostPerM:2.00, replacement:'Default economical general-purpose model'},
+  {id:'openai/gpt-5.4', provider:'OpenAI', inputCostPerM:2.00, outputCostPerM:10.00, replacement:'Use for complex synthesis; fall back to Mini for routine turns'},
+  {id:'anthropic/claude-sonnet-4.5', provider:'Anthropic', inputCostPerM:3.00, outputCostPerM:15.00, replacement:'Strong coding and analysis option; use Mini for low-risk chat'},
+  {id:'google/gemini-2.5-pro', provider:'Google', inputCostPerM:1.25, outputCostPerM:10.00, replacement:'Long-context research option; use Flash for speed-sensitive work'},
+  {id:'google/gemini-2.5-flash', provider:'Google', inputCostPerM:0.30, outputCostPerM:2.50, replacement:'Low-latency replacement for lighter multimodal or research turns'},
+];
+
+function _renderModelHealthCost(row) {
+  const input = Number(row.inputCostPerM || 0);
+  const output = Number(row.outputCostPerM || 0);
+  return `$${input.toFixed(2)} / $${output.toFixed(2)}`;
+}
+
+function _renderStaticModelHealthTable() {
+  const rows = STATIC_MODEL_HEALTH_ROWS.map(row => `<div class="insights-table-row">
+    <span class="insights-model-name" title="${esc(row.id)}">${esc(row.id)}</span>
+    <span>${esc(row.provider)}</span>
+    <span>${esc(_renderModelHealthCost(row))}</span>
+    <span class="insights-model-health-replacement">${esc(row.replacement)}</span>
+  </div>`).join('');
+  return `<details class="insights-card insights-model-health-card"><summary><span class="insights-card-title">${esc(t('insights_model_health_title'))}</span></summary><div class="insights-table insights-model-health-table"><div class="insights-table-head"><span>${esc(t('insights_model_name'))}</span><span>${esc(t('insights_model_health_provider'))}</span><span>${esc(t('insights_model_health_cost_per_m'))}</span><span>${esc(t('insights_model_health_replacement'))}</span></div>${rows}</div></details>`;
+}
+
 async function loadInsights(animate) {
   const box = $('insightsContent');
   const refreshBtn = $('insightsRefreshBtn');
@@ -3684,6 +3708,7 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
   } else {
     modelsHtml = `<div class="insights-card"><div class="insights-card-title">${esc(t('insights_models'))}</div><div class="insights-empty">${esc(t('insights_no_usage_data'))}</div></div>`;
   }
+  const modelHealthHtml = _renderStaticModelHealthTable();
 
   // Activity by day of week
   let dowHtml = '';
@@ -3737,6 +3762,7 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
       ${overviewCards.map(c => `<div class="insights-stat"><div class="insights-stat-icon">${c.icon}</div><div class="insights-stat-info"><div class="insights-stat-value">${c.value}</div><div class="insights-stat-label">${esc(c.label)}</div></div></div>`).join('')}
     </div>
     ${dailyHtml}
+    ${modelHealthHtml}
     <div class="insights-row insights-usage-grid">
       ${tokenCards}
       ${modelsHtml}
@@ -4182,13 +4208,14 @@ let _notesSelectedSource = 'joplin';
 let _notesPreviewNote = null;
 let _notesSearchError = '';
 let _notesSearchLoading = false;
-let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'external_notes'
+let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'project_context' | 'external_notes'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
 const MEMORY_SECTIONS = [
   { key: 'memory', labelKey: 'my_notes', emptyKey: 'no_notes_yet', iconKey: 'brain' },
   { key: 'user',   labelKey: 'user_profile', emptyKey: 'no_profile_yet', iconKey: 'user' },
   { key: 'soul',   labelKey: 'agent_soul', emptyKey: 'no_soul_yet', iconKey: 'sparkles' },
+  { key: 'project_context', label: 'Project Context', empty: 'No project context file found for this workspace.', iconKey: 'file-text', readOnly: true },
   { key: 'external_notes', labelKey: 'external_notes_sources', emptyKey: 'external_notes_empty', iconKey: 'book-open' },
 ];
 
@@ -4196,10 +4223,21 @@ function _memorySectionMeta(key) {
   return MEMORY_SECTIONS.find(s => s.key === key) || MEMORY_SECTIONS[0];
 }
 
+function _memorySectionLabel(meta) {
+  if (meta.label) return meta.label;
+  return t(meta.labelKey);
+}
+
+function _memorySectionEmpty(meta) {
+  if (meta.empty) return meta.empty;
+  return t(meta.emptyKey);
+}
+
 function _memorySectionContent(key) {
   if (!_memoryData) return '';
   if (key === 'user') return _memoryData.user || '';
   if (key === 'soul') return _memoryData.soul || '';
+  if (key === 'project_context') return _memoryData.project_context || '';
   return _memoryData.memory || '';
 }
 
@@ -4207,6 +4245,7 @@ function _memorySectionMtime(key) {
   if (!_memoryData) return 0;
   if (key === 'user') return _memoryData.user_mtime || 0;
   if (key === 'soul') return _memoryData.soul_mtime || 0;
+  if (key === 'project_context') return _memoryData.project_context_mtime || 0;
   return _memoryData.memory_mtime || 0;
 }
 
@@ -4216,7 +4255,8 @@ function _setMemoryHeaderButtons(mode) {
   const editBtn = $('btnEditMemoryDetail');
   const cancelBtn = $('btnCancelMemoryDetail');
   const saveBtn = $('btnSaveMemoryDetail');
-  if (mode === 'read' && _currentMemorySection !== 'external_notes') { show(editBtn); hide(cancelBtn); hide(saveBtn); }
+  const meta = _memorySectionMeta(_currentMemorySection);
+  if (mode === 'read' && _currentMemorySection !== 'external_notes' && !meta.readOnly) { show(editBtn); hide(cancelBtn); hide(saveBtn); }
   else if (mode === 'edit') { hide(editBtn); show(cancelBtn); show(saveBtn); }
   else { hide(editBtn); hide(cancelBtn); hide(saveBtn); }
 }
@@ -4299,15 +4339,24 @@ function _renderMemoryDetail(section) {
   const body = $('memoryDetailBody');
   const empty = $('memoryDetailEmpty');
   if (!title || !body) return;
-  title.textContent = t(meta.labelKey);
+  title.textContent = _memorySectionLabel(meta);
   const content = _memorySectionContent(section);
   const mtime = _memorySectionMtime(section);
   const mtimeStr = mtime ? new Date(mtime * 1000).toLocaleString() : '';
   const mtimeHtml = mtimeStr ? `<div class="memory-detail-mtime">${esc(mtimeStr)}</div>` : '';
+  const path = section === 'project_context' && _memoryData ? (_memoryData.project_context_path || '') : '';
+  const fileName = section === 'project_context' && _memoryData ? (_memoryData.project_context_name || (path.split(/[\\/]/).pop() || '')) : '';
+  const pathHtml = path ? `<div class="memory-detail-mtime">${esc(fileName)} · ${esc(path)}</div>` : '';
+  const shadowed = section === 'project_context' && _memoryData && Array.isArray(_memoryData.project_context_shadowed)
+    ? _memoryData.project_context_shadowed
+    : [];
+  const shadowedHtml = shadowed.length
+    ? `<div class="memory-detail-mtime">${esc(shadowed.map(item => `${item.name || 'Context file'} present, shadowed by ${item.shadowed_by || fileName || 'active context'}`).join('; '))}</div>`
+    : '';
   const inner = content
     ? `<div class="memory-content preview-md">${renderMd(content)}</div>`
-    : `<div class="memory-empty">${esc(t(meta.emptyKey))}</div>`;
-  body.innerHTML = `<div class="main-view-content">${mtimeHtml}${inner}</div>`;
+    : `<div class="memory-empty">${esc(_memorySectionEmpty(meta))}</div>`;
+  body.innerHTML = `<div class="main-view-content">${pathHtml}${mtimeHtml}${shadowedHtml}${inner}</div>`;
   body.style.display = '';
   if (empty) empty.style.display = 'none';
   _memoryMode = 'read';
@@ -4320,7 +4369,7 @@ function _renderMemoryEdit(section) {
   const body = $('memoryDetailBody');
   const empty = $('memoryDetailEmpty');
   if (!title || !body) return;
-  title.textContent = t(meta.labelKey);
+  title.textContent = _memorySectionLabel(meta);
   const content = _memorySectionContent(section);
   body.innerHTML = `
     <div class="main-view-content">
@@ -4411,7 +4460,8 @@ async function openMemorySection(section, el) {
 }
 
 function editCurrentMemory() {
-  if (!_currentMemorySection || _currentMemorySection === 'external_notes') return;
+  const meta = _memorySectionMeta(_currentMemorySection);
+  if (!_currentMemorySection || _currentMemorySection === 'external_notes' || meta.readOnly) return;
   _renderMemoryEdit(_currentMemorySection);
 }
 
@@ -4426,6 +4476,7 @@ function closeMemoryEdit() { cancelMemoryEdit(); }
 
 async function submitMemorySave() {
   if (!_currentMemorySection) return;
+  if (_memorySectionMeta(_currentMemorySection).readOnly) return;
   const ta = $('memEditContent');
   const errEl = $('memEditError');
   if (!ta) return;
@@ -5213,6 +5264,7 @@ async function switchToWorkspace(path,name){
     S._profileSwitchWorkspace=null;
     syncTopbar();
     await loadDir('.');
+    if (_currentPanel === 'memory') await loadMemory(true);
     showToast(t('workspace_switched_to',name||getWorkspaceFriendlyName(path)));
   }catch(e){setStatus(t('switch_failed')+e.message);}
 }
@@ -5539,6 +5591,14 @@ async function switchToProfile(name) {
     S.activeProfile = data.active || name;
     S.activeProfileIsDefault = !!data.is_default;
 
+    // Reconnect the gateway SSE to the NEW profile's watcher. The backend watcher
+    // registry is now profile-keyed (#3629), but this tab's existing EventSource is
+    // still subscribed to the PREVIOUS profile's watcher — and the probe-based
+    // reattach is gated on `!_gatewaySSE`, which can't fire while the old stream is
+    // open. startGatewaySSE() closes the old ES (stopGatewaySSE) and reconnects with
+    // the new profile cookie; it self-gates on window._showCliSessions internally.
+    if (typeof startGatewaySSE === 'function') startGatewaySSE();
+
     // Update composer placeholder and title bar while the core profile-switch
     // state is still close to the profile API response.
     if (typeof applyBotName === 'function') applyBotName();
@@ -5721,7 +5781,7 @@ async function _populateProfileFormModelSelect(){
       const og = document.createElement('optgroup');
       og.label = g.provider || g.provider_id || 'Configured';
       if (g.provider_id) og.dataset.provider = g.provider_id;
-      for (const m of (Array.isArray(g.models) ? g.models : [])) {
+      for (const m of [...(Array.isArray(g.models) ? g.models : []), ...(Array.isArray(g.extra_models) ? g.extra_models : [])]) {
         if (!m || !m.id) continue;
         const opt = document.createElement('option');
         opt.value = m.id;
@@ -5809,7 +5869,10 @@ async function deleteProfile(name) {
 async function loadMemory(force) {
   const panel = $('memoryPanel');
   try {
-    const data = await api('/api/memory');
+    const memoryUrl = S.session && S.session.session_id
+      ? `/api/memory?session_id=${encodeURIComponent(S.session.session_id)}`
+      : '/api/memory';
+    const data = await api(memoryUrl);
     _memoryData = data;
     if (_currentMemorySection === 'external_notes' && !data.external_notes_enabled) {
       _currentMemorySection = null;
@@ -5825,7 +5888,7 @@ async function loadMemory(force) {
         el.type = 'button';
         el.className = 'side-menu-item';
         if (_currentMemorySection === s.key) el.classList.add('active');
-        el.innerHTML = `${li(s.iconKey,16)}<span>${esc(t(s.labelKey))}</span>`;
+        el.innerHTML = `${li(s.iconKey,16)}<span>${esc(_memorySectionLabel(s))}</span>`;
         el.onclick = () => openMemorySection(s.key, el);
         panel.appendChild(el);
       }
@@ -6352,6 +6415,8 @@ function _preferencesPayloadFromUi(){
   if(fadeTextCb) payload.fade_text_effect=fadeTextCb.checked;
   const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
   if(terminalAutoExpandCb) payload.terminal_auto_expand_on_output=terminalAutoExpandCb.checked;
+  const workspaceTodosTabCb=$('settingsWorkspaceTodosTab');
+  if(workspaceTodosTabCb) payload.workspace_todos_tab=workspaceTodosTabCb.checked;
   const apiRedactCb=$('settingsApiRedact');
   if(apiRedactCb) payload.api_redact_enabled=apiRedactCb.checked;
   const showCliCb=$('settingsShowCliSessions');
@@ -6414,6 +6479,15 @@ function _rememberPreferencesSaved(payload){
   if(payload.language!==undefined) localStorage.setItem('hermes-pref-language',payload.language);
 }
 
+function _applyWorkspaceTodosTabVisibility(){
+  const tab=$('workspaceTodosTab');
+  if(tab) tab.hidden=!window._workspaceTodosTab;
+  const rp=document.querySelector('.rightpanel');
+  if(!window._workspaceTodosTab && rp && rp.dataset.activeTab==='todos'){
+    if(typeof switchWorkspacePanelTab==='function') switchWorkspacePanelTab('files');
+  }
+}
+
 function _schedulePreferencesAutosave(){
   const payload=_preferencesPayloadFromUi();
   _rememberPreferencesSaved(payload);
@@ -6428,6 +6502,10 @@ async function _autosavePreferencesSettings(payload){
     const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
     if(payload&&payload.terminal_auto_expand_on_output!==undefined){
       window._terminalAutoExpandOnOutput=!!(saved&&saved.terminal_auto_expand_on_output);
+    }
+    if(payload&&payload.workspace_todos_tab!==undefined){
+      window._workspaceTodosTab=!!(saved&&saved.workspace_todos_tab);
+      if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
     }
     if(payload&&Object.prototype.hasOwnProperty.call(payload,'fade_text_effect')) window._fadeTextEffect=!!payload.fade_text_effect;
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'pinned_sessions_limit')) window._pinnedSessionsLimit=parseInt(saved.pinned_sessions_limit,10)||3;
@@ -6609,7 +6687,7 @@ async function loadSettingsPanel(){
           const og=document.createElement('optgroup');
           og.label=g.provider;
           if(g.provider_id) og.dataset.provider=g.provider_id;
-          for(const m of g.models){
+          for(const m of [...(g.models||[]),...(g.extra_models||[])]){
             const opt=document.createElement('option');
             opt.value=m.id;opt.textContent=m.label;
             og.appendChild(opt);
@@ -6636,6 +6714,7 @@ async function loadSettingsPanel(){
       modelSel.addEventListener('change',_markSettingsDirty,{once:false});
     }
     // Auxiliary models — load task assignments and provider/model options
+    _bindMainAdvancedOptionsButton();
     _loadAuxiliaryModels();
     // Send key preference
     const sendKeySel=$('settingsSendKey');
@@ -6715,10 +6794,21 @@ async function loadSettingsPanel(){
     }
     const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
     if(terminalAutoExpandCb){terminalAutoExpandCb.checked=!!settings.terminal_auto_expand_on_output;window._terminalAutoExpandOnOutput=terminalAutoExpandCb.checked;terminalAutoExpandCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const workspaceTodosTabCb=$('settingsWorkspaceTodosTab');
+    if(workspaceTodosTabCb){
+      workspaceTodosTabCb.checked=!!settings.workspace_todos_tab;
+      window._workspaceTodosTab=workspaceTodosTabCb.checked;
+      _applyWorkspaceTodosTabVisibility();
+      workspaceTodosTabCb.addEventListener('change',()=>{
+        window._workspaceTodosTab=workspaceTodosTabCb.checked;
+        _applyWorkspaceTodosTabVisibility();
+        _schedulePreferencesAutosave();
+      },{once:false});
+    }
     const apiRedactCb=$('settingsApiRedact');
     if(apiRedactCb){apiRedactCb.checked=settings.api_redact_enabled!==false;apiRedactCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
-    if(showCliCb){showCliCb.checked=!!settings.show_cli_sessions;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    if(showCliCb){showCliCb.checked=settings.show_cli_sessions!==false;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCronCb=$('settingsShowCronSessions');
     if(showCronCb){
       showCronCb.checked=!!settings.show_cron_sessions;
@@ -7829,6 +7919,8 @@ function _applySavedSettingsUi(saved, body, opts){
   window._simplifiedToolCalling=true;
   _syncChatActivityDisplayModeControl(body.chat_activity_display_mode);
   window._terminalAutoExpandOnOutput=!!body.terminal_auto_expand_on_output;
+  window._workspaceTodosTab=!!body.workspace_todos_tab;
+  if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
   window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   window._sidebarDensity=sidebarDensity==='detailed'?'detailed':'compact';
@@ -7926,19 +8018,23 @@ async function checkUpdatesNow(){
 // Canonical auxiliary task slots with display names.
 // Keep in sync with hermes_cli/main.py _AUX_TASKS and hermes_cli/web_server.py _AUX_TASK_SLOTS.
 const _AUX_TASK_SLOTS=[
- {key:'vision',name:'Vision',desc:'image/screenshot analysis'},
- {key:'compression',name:'Compression',desc:'context summarization'},
- {key:'web_extract',name:'Web extract',desc:'web page summarization'},
- {key:'session_search',name:'Session search',desc:'past-conversation recall'},
- {key:'approval',name:'Approval',desc:'smart command approval'},
- {key:'mcp',name:'MCP',desc:'MCP tool reasoning'},
- {key:'title_generation',name:'Title generation',desc:'session titles'},
- {key:'skills_hub',name:'Skills hub',desc:'skills search/install'},
- {key:'curator',name:'Curator',desc:'skill-usage review pass'},
+ {key:'vision',nameKey:'settings_aux_task_vision',descKey:'settings_aux_task_vision_desc'},
+ {key:'compression',nameKey:'settings_aux_task_compression',descKey:'settings_aux_task_compression_desc'},
+ {key:'web_extract',nameKey:'settings_aux_task_web_extract',descKey:'settings_aux_task_web_extract_desc'},
+ {key:'session_search',nameKey:'settings_aux_task_session_search',descKey:'settings_aux_task_session_search_desc'},
+ {key:'approval',nameKey:'settings_aux_task_approval',descKey:'settings_aux_task_approval_desc'},
+ {key:'mcp',nameKey:'settings_aux_task_mcp',descKey:'settings_aux_task_mcp_desc'},
+ {key:'title_generation',nameKey:'settings_aux_task_title_generation',descKey:'settings_aux_task_title_generation_desc'},
+ {key:'skills_hub',nameKey:'settings_aux_task_skills_hub',descKey:'settings_aux_task_skills_hub_desc'},
+ {key:'curator',nameKey:'settings_aux_task_curator',descKey:'settings_aux_task_curator_desc'},
+ {key:'kanban_decomposer',nameKey:'settings_aux_task_kanban_decomposer',descKey:'settings_aux_task_kanban_decomposer_desc'},
+ {key:'profile_describer',nameKey:'settings_aux_task_profile_describer',descKey:'settings_aux_task_profile_describer_desc'},
+ {key:'triage_specifier',nameKey:'settings_aux_task_triage_specifier',descKey:'settings_aux_task_triage_specifier_desc'},
 ];
 
-let _auxProviders=[];       // cached provider list from /api/model/options
+let _auxProviders=[];       // cached provider list from /api/models
 let _auxOriginalConfig=null; // snapshot of initial config for dirty detection
+let _mainAdvancedConfig=null; // current advanced config for the default chat model
 
 function _auxSelectStyle(){
  return 'width:100%;padding:6px 8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px;box-sizing:border-box';
@@ -8026,6 +8122,154 @@ function _markAuxDirty(){
  _markSettingsDirty();
 }
 
+function _auxAdvancedValue(cfg,key){
+ const v=cfg&&Object.prototype.hasOwnProperty.call(cfg,key)?cfg[key]:'';
+ return v===null||v===undefined?'':String(v);
+}
+
+function _ensureAuxAdvancedModal(){
+ let overlay=$('auxAdvancedOverlay');
+ if(overlay) return overlay;
+ overlay=document.createElement('div');
+ overlay.id='auxAdvancedOverlay';
+ overlay.style.cssText='position:fixed;inset:0;z-index:9999;background:rgba(5,7,15,.68);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;padding:20px';
+ const neutralBtn='font-size:12px;padding:7px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;font-weight:600';
+ const primaryBtn='font-size:12px;padding:7px 12px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#1a1a1a;cursor:pointer;font-weight:700';
+ overlay.innerHTML=`<div role="dialog" aria-modal="true" aria-labelledby="auxAdvancedTitle" style="width:min(620px,calc(100vw - 32px));max-height:calc(100vh - 48px);overflow:auto;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.45);padding:16px">
+  <style>#auxAdvancedOverlay input:-webkit-autofill,#auxAdvancedOverlay textarea:-webkit-autofill{box-shadow:0 0 0 1000px var(--code-bg) inset!important;-webkit-box-shadow:0 0 0 1000px var(--code-bg) inset!important;-webkit-text-fill-color:var(--text)!important;caret-color:var(--text)!important}</style>
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px">
+   <div><div id="auxAdvancedTitle" style="font-weight:700;font-size:16px"></div><div id="auxAdvancedSubtitle" style="font-size:11px;color:var(--muted);margin-top:2px"></div></div>
+   <button type="button" id="auxAdvancedClose" aria-label="${esc(t('terminal_close')||'Close')}" style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border-radius:8px;border:1px solid var(--border);background:var(--input-bg);color:var(--text);cursor:pointer;font-size:18px;line-height:1">×</button>
+  </div>
+  <div id="auxAdvancedBody" style="display:grid;gap:10px"></div>
+  <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+   <button type="button" id="auxAdvancedCancel" style="${neutralBtn}">${esc(t('cancel')||'Cancel')}</button>
+   <button type="button" id="auxAdvancedSave" style="${primaryBtn}">${esc(t('settings_aux_advanced_save')||'Save options')}</button>
+  </div>
+ </div>`;
+ document.body.appendChild(overlay);
+ const close=()=>{overlay.style.display='none';overlay.dataset.task='';};
+ $('auxAdvancedClose')?.addEventListener('click',close);
+ $('auxAdvancedCancel')?.addEventListener('click',close);
+ overlay.addEventListener('click',ev=>{if(ev.target===overlay) close();});
+ return overlay;
+}
+
+function _auxAdvancedInputHtml(id,label,value,desc,type='text',extraAttrs='',extraStyle=''){
+ const fieldName=id==='auxAdvancedApiKey'?'aux-manual-override-value':('aux-field-'+id.replace(/^auxAdvanced/,'').toLowerCase());
+ const autocompleteAttr=/\bautocomplete=/.test(extraAttrs)?'':'autocomplete="off"';
+ const inputAttrs=`id="${id}" name="${fieldName}" type="${type}" value="${esc(value)}" ${autocompleteAttr} autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" ${extraAttrs}`;
+ return `<label style="display:grid;gap:4px;font-size:12px;color:var(--text)"><span style="font-weight:600">${esc(label)}</span><input ${inputAttrs} style="width:100%;box-sizing:border-box;padding:7px 8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px${extraStyle}"><span style="font-size:10px;color:var(--muted);line-height:1.35">${esc(desc)}</span></label>`;
+}
+
+function _openAuxAdvancedOptions(taskKey,cfg){
+ const isMain=taskKey==='__main__';
+ const slot=isMain?{key:taskKey,nameKey:'settings_label_model',descKey:'settings_desc_model'}:(_AUX_TASK_SLOTS.find(s=>s.key===taskKey)||{key:taskKey,nameKey:'',descKey:''});
+ const overlay=_ensureAuxAdvancedModal();
+ overlay.dataset.task=taskKey;
+ const title=$('auxAdvancedTitle'),sub=$('auxAdvancedSubtitle'),body=$('auxAdvancedBody');
+ const slotName=t(slot.nameKey)||slot.key;
+ if(title) title.textContent=isMain?(t('settings_main_advanced_title')||'Main model options'):((t('settings_aux_advanced_title')||'{task} options').replace('{task}',slotName));
+ if(sub) sub.textContent=isMain?(t('settings_main_advanced_subtitle')||'Advanced config for the default chat model.'):(t('settings_aux_advanced_subtitle')||'Advanced config for auxiliary.');
+ const extraBody=cfg&&cfg.extra_body&&typeof cfg.extra_body==='object'&&Object.keys(cfg.extra_body).length?JSON.stringify(cfg.extra_body,null,2):'';
+ const apiKeyHint=cfg&&cfg.api_key_set?(t('settings_aux_advanced_api_key_set_hint')||'API key is set. Leave blank to keep it, or use clear to remove it.'):(t('settings_aux_advanced_api_key_empty_hint')||'Leave blank to use provider/default credentials.');
+ if(body){
+  const timingFields=isMain?'':(
+   _auxAdvancedInputHtml('auxAdvancedTimeout',t('settings_aux_advanced_timeout')||'Timeout seconds',_auxAdvancedValue(cfg,'timeout'),t('settings_aux_advanced_timeout_desc')||'Request timeout for this auxiliary task. Blank uses Hermes default.','number','inputmode="numeric" min="1" step="1"')+
+   _auxAdvancedInputHtml('auxAdvancedDownloadTimeout',t('settings_aux_advanced_download_timeout')||'Download timeout seconds',_auxAdvancedValue(cfg,'download_timeout'),t('settings_aux_advanced_download_timeout_desc')||'Only relevant for tasks that download media/content, e.g. vision. Blank uses default.','number','inputmode="numeric" min="1" step="1"')+
+   _auxAdvancedInputHtml('auxAdvancedMaxConcurrency',t('settings_aux_advanced_max_concurrency')||'Max concurrency',_auxAdvancedValue(cfg,'max_concurrency'),t('settings_aux_advanced_max_concurrency_desc')||'Optional per-task concurrency limit. Blank uses default.','number','inputmode="numeric" min="1" step="1"'));
+  body.innerHTML=
+   _auxAdvancedInputHtml('auxAdvancedBaseUrl',t('settings_aux_advanced_base_url')||'Base URL',_auxAdvancedValue(cfg,'base_url'),t('settings_aux_advanced_base_url_desc')||'Optional provider endpoint override.','text','inputmode="url"')+
+   timingFields+
+   `<label style="display:grid;gap:4px;font-size:12px;color:var(--text)"><span style="font-weight:600">${esc(t('settings_aux_advanced_extra_body')||'Extra body JSON')}</span><textarea id="auxAdvancedExtraBody" rows="6" style="width:100%;box-sizing:border-box;padding:7px 8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px;font-family:var(--mono,monospace)">${esc(extraBody)}</textarea><span style="font-size:10px;color:var(--muted);line-height:1.35">${esc(t('settings_aux_advanced_extra_body_desc')||'Optional JSON object merged into the model request body.')}</span></label>`+
+   _auxAdvancedInputHtml('auxAdvancedApiKey',t('settings_aux_advanced_api_key')||'API key override','',apiKeyHint,'text','autocomplete="one-time-code" inputmode="text" readonly onfocus="this.removeAttribute(&quot;readonly&quot;)"',';-webkit-text-security:disc')+
+   `<label style="display:${cfg&&cfg.api_key_set?'flex':'none'};align-items:center;gap:8px;font-size:12px;color:var(--text)"><input id="auxAdvancedApiKeyClear" type="checkbox" style="width:15px;height:15px;accent-color:var(--accent)"><span>${esc(t('settings_aux_advanced_api_key_clear')||'Clear existing API key override')}</span></label>`;
+ }
+ const save=$('auxAdvancedSave');
+ if(save){
+  save.onclick=async()=>{
+   let extra={};
+   const extraText=($('auxAdvancedExtraBody')?.value||'').trim();
+   if(extraText){
+    try{extra=JSON.parse(extraText);}catch(e){if(typeof showToast==='function') showToast(t('settings_aux_advanced_extra_body_invalid_json')||'Extra body must be valid JSON');return;}
+    if(!extra||Array.isArray(extra)||typeof extra!=='object'){if(typeof showToast==='function') showToast(t('settings_aux_advanced_extra_body_object_required')||'Extra body must be a JSON object');return;}
+   }
+   const provSel=isMain?null:$('aux-prov-'+taskKey),modelSel=isMain?$('settingsModel'):$('aux-model-'+taskKey);
+   const provider=isMain?((cfg&&cfg.provider)||''):(provSel?provSel.value:((cfg&&cfg.provider)||'auto'));
+   const model=modelSel&&modelSel.value!=='__custom__'?(modelSel.value||''):((cfg&&cfg.model)||'');
+   const advanced={
+    base_url:$('auxAdvancedBaseUrl')?.value||'',
+    extra_body:extra,
+    api_key:$('auxAdvancedApiKey')?.value||'',
+    api_key_clear:!!($('auxAdvancedApiKeyClear')&&$('auxAdvancedApiKeyClear').checked),
+   };
+   if(!isMain){
+    advanced.timeout=$('auxAdvancedTimeout')?.value||'';
+    advanced.download_timeout=$('auxAdvancedDownloadTimeout')?.value||'';
+    advanced.max_concurrency=$('auxAdvancedMaxConcurrency')?.value||'';
+   }
+   try{
+    await api('/api/model/set',{method:'POST',body:JSON.stringify({scope:isMain?'main':'auxiliary',task:isMain?'':taskKey,provider,model,advanced})});
+    if(typeof showToast==='function') showToast(isMain?(t('settings_main_advanced_saved')||'Main model options saved'):(t('settings_aux_advanced_saved')||'Auxiliary options saved'));
+    overlay.style.display='none';
+    _loadAuxiliaryModels();
+   }catch(e){
+    if(typeof showToast==='function') showToast(isMain?(t('settings_main_advanced_save_failed')||'Failed to save main model options'):(t('settings_aux_advanced_save_failed')||'Failed to save auxiliary options'));
+   }
+  };
+ }
+ overlay.style.display='flex';
+ setTimeout(()=>$('auxAdvancedBaseUrl')?.focus(),0);
+}
+
+function _bindMainAdvancedOptionsButton(){
+ const modelSel=$('settingsModel');
+ let btn=$('mainAdvancedBtn');
+ if(modelSel){
+  const parent=modelSel.parentElement;
+  let row=parent&&parent.classList&&parent.classList.contains('model-advanced-row')?parent:null;
+  if(!row){
+   row=document.createElement('div');
+   row.className='model-advanced-row';
+   parent.insertBefore(row,modelSel);
+   row.appendChild(modelSel);
+  }
+  if(!btn){
+   btn=document.createElement('button');
+   btn.type='button';
+   btn.id='mainAdvancedBtn';
+  }
+  if(btn.parentElement!==row) row.appendChild(btn);
+  row.style.cssText='display:grid;grid-template-columns:minmax(0,1fr) 34px;gap:8px;align-items:center';
+  modelSel.style.width='100%';
+  modelSel.style.minWidth='0';
+  modelSel.style.boxSizing='border-box';
+ }
+ if(!btn) return;
+ btn.classList.add('model-advanced-btn');
+ if(!btn.querySelector('svg')&&typeof li==='function') btn.innerHTML=li('settings',15);
+ btn.style.position='';
+ btn.style.right='';
+ btn.style.top='';
+ btn.style.transform='';
+ btn.style.width='32px';
+ btn.style.height='32px';
+ btn.style.display='flex';
+ btn.style.alignItems='center';
+ btn.style.justifyContent='center';
+ btn.style.flex='0 0 32px';
+ btn.style.boxSizing='border-box';
+ const title=t('settings_aux_advanced_button_title')||'Advanced options';
+ btn.title=title;
+ btn.setAttribute('aria-label',t('settings_main_advanced_button_aria')||'Advanced options for main model');
+ btn.disabled=_mainAdvancedConfig===null;
+ btn.style.opacity='';
+ btn.style.cursor='';
+ if(btn._bound) return;
+ btn._bound=true;
+ btn.addEventListener('click',()=>{if(_mainAdvancedConfig!==null)_openAuxAdvancedOptions('__main__',_mainAdvancedConfig||{});});
+}
+
 async function _loadAuxiliaryModels(){
  const container=$('auxModelsContainer');
  if(!container) return;
@@ -8040,11 +8284,17 @@ async function _loadAuxiliaryModels(){
  // Build provider list from /api/models groups
  // /api/models returns: { groups: [{ provider: str, provider_id: str, models: [{id,label}] }] }
  const groups=(modelsData&&modelsData.groups)||[];
- _auxProviders=groups.filter(g=>g.provider&&g.models&&g.models.length>0).map(g=>({
+ _auxProviders=groups.filter(g=>g.provider&&((g.models&&g.models.length>0)||(g.extra_models&&g.extra_models.length>0))).map(g=>({
  slug:g.provider_id||g.provider,
  name:g.provider,
- models:g.models.map(m=>m.id),
+ models:[...(g.models||[]),...(g.extra_models||[])].map(m=>m.id),
  }));
+ if(auxData&&Object.prototype.hasOwnProperty.call(auxData,'main')){
+ _mainAdvancedConfig=auxData.main||{};
+ }else{
+ _mainAdvancedConfig=null;
+ }
+ _bindMainAdvancedOptionsButton();
  const tasks=(auxData&&auxData.tasks)||[];
   // Build a quick lookup: taskKey → {provider, model}
   const taskMap={};
@@ -8055,12 +8305,12 @@ async function _loadAuxiliaryModels(){
   for(const slot of _AUX_TASK_SLOTS){
    const cfg=taskMap[slot.key]||{provider:'auto',model:''};
    const row=document.createElement('div');
-   row.style.cssText='display:grid;grid-template-columns:120px 1fr 1fr;gap:8px;align-items:center;margin-bottom:8px';
+   row.style.cssText='display:grid;grid-template-columns:120px 1fr 1fr 34px;gap:8px;align-items:center;margin-bottom:8px';
 
    // Task name + description
    const label=document.createElement('div');
    label.style.cssText='font-size:12px;font-weight:500;color:var(--text);line-height:1.3';
-   label.innerHTML=esc(slot.name)+'<div style="font-size:10px;color:var(--muted);font-weight:400">'+esc(slot.desc)+'</div>';
+   label.innerHTML=esc(t(slot.nameKey)||slot.key)+'<div style="font-size:10px;color:var(--muted);font-weight:400">'+esc(t(slot.descKey)||'')+'</div>';
    row.appendChild(label);
 
    // Provider select
@@ -8078,6 +8328,17 @@ async function _loadAuxiliaryModels(){
    _buildAuxModelOptions(modelSel,cfg.provider,_auxProviders,cfg.model);
    modelSel.addEventListener('change',()=>_onAuxModelChange(slot.key));
    row.appendChild(modelSel);
+
+   const advancedBtn=document.createElement('button');
+   advancedBtn.type='button';
+   advancedBtn.className='aux-advanced-btn model-advanced-btn';
+   const advTitle=t('settings_aux_advanced_button_title')||'Advanced options';
+   const slotName=t(slot.nameKey)||slot.key;
+   advancedBtn.title=advTitle;
+   advancedBtn.setAttribute('aria-label',(t('settings_aux_advanced_button_aria')||'Advanced options for {task}').replace('{task}',slotName));
+   advancedBtn.innerHTML=typeof li==='function'?li('settings',15):'⚙';
+   advancedBtn.addEventListener('click',()=>_openAuxAdvancedOptions(slot.key,cfg));
+   row.appendChild(advancedBtn);
 
    container.appendChild(row);
   }
@@ -8128,7 +8389,7 @@ async function _applyAuxModels(){
     saved++;
    }catch(e){
     console.warn('[settings] failed to save aux task',slot.key,e);
-    if(typeof showToast==='function') showToast(t('settings_aux_save_failed')||'Failed to save auxiliary model for '+slot.name);
+    if(typeof showToast==='function') showToast(t('settings_aux_save_failed')||'Failed to save auxiliary model');
     return;
    }
   }
@@ -8175,6 +8436,7 @@ async function saveSettings(andClose){
   body.show_tps=showTps;
   body.fade_text_effect=fadeTextEffect;
   body.terminal_auto_expand_on_output=!!($('settingsTerminalAutoExpand')||{}).checked;
+  body.workspace_todos_tab=!!window._workspaceTodosTab;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
   // Cron sessions are gated on CLI sessions (server short-circuits otherwise);
@@ -8303,6 +8565,9 @@ function startCronPolling(){
           }
           _cronPollSince=Math.max(_cronPollSince,c.completed_at);
           if(c.job_id) _cronNewJobIds.add(String(c.job_id));
+          if(c.session_id && typeof _markSessionCompletionUnreadIfBackground === 'function'){
+            _markSessionCompletionUnreadIfBackground(c.session_id, c.message_count);
+          }
         }
         // _cronUnreadCount is derived from _cronNewJobIds.size in updateCronBadge.
         updateCronBadge();
@@ -8407,10 +8672,16 @@ function toggleMcpServer(name, enabled){
     method:'PATCH',
     body:JSON.stringify({enabled:enabled}),
   }).then(r=>{
-    if(r&&r.ok) showToast(t(enabled?'mcp_enabled_toast':'mcp_disabled_toast',name));
+    if(r&&r.ok){
+      _refreshMcpToolsetsCatalog();
+      showToast(t(enabled?'mcp_enabled_toast':'mcp_disabled_toast',name));
+    }
     else showToast(t('mcp_toggle_failed'),'error');
     loadMcpServers();
   }).catch(()=>{showToast(t('mcp_toggle_failed'),'error');loadMcpServers();});
+}
+function _refreshMcpToolsetsCatalog(payload){
+  if(typeof window.invalidateToolsetsCatalog==='function') window.invalidateToolsetsCatalog(payload);
 }
 function loadMcpServers(){
   const list=$('mcpServerList');
@@ -8418,6 +8689,7 @@ function loadMcpServers(){
   list.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t('loading'))}</div>`;
   api('/api/mcp/servers').then(r=>{
     if(!r||!Array.isArray(r.servers)) return;
+    _refreshMcpToolsetsCatalog(r);
     if(!r.servers.length){
       list.innerHTML=`<div class="mcp-empty-state" style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t('mcp_no_servers'))}</div>`;
       return;
@@ -8727,8 +8999,30 @@ async function _restoreCheckpoint(workspace,checkpoint,message){
 
 function updateNotificationPermissionStatus(){
   const el=$('notificationPermissionStatus');
+  const btn=$('notificationPermissionButton');
+  const btnWrap=$('notificationPermissionButtonWrap');
   if(!el) return;
-  if(!('Notification' in window)){el.textContent=t('notifications_unsupported');return;}
+  if(!('Notification' in window)){
+    const unsupported=t('notifications_unsupported');
+    el.textContent=unsupported;
+    if(btn){
+      btn.disabled=true;
+      btn.title='';
+      btn.setAttribute('aria-label', unsupported);
+      btn.setAttribute('aria-disabled','true');
+    }
+    if(btnWrap) btnWrap.title=unsupported;
+    return;
+  }
   const perm=Notification.permission||'default';
-  el.textContent=t('notifications_permission_status', perm);
+  const label=t('notifications_permission_status', perm);
+  el.textContent=label;
+  if(btn){
+    const granted=perm==='granted';
+    btn.disabled=granted;
+    btn.title=granted?'':label;
+    btn.setAttribute('aria-label', label);
+    btn.setAttribute('aria-disabled', granted?'true':'false');
+  }
+  if(btnWrap) btnWrap.title=label;
 }

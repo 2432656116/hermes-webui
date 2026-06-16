@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -1567,6 +1569,9 @@ def _format_nous_label(mid: str) -> str:
 # without one vendor dominating.
 _NOUS_FEATURED_THRESHOLD = 25
 _NOUS_FEATURED_TARGET = 15
+_MODEL_PICKER_OVERFLOW_THRESHOLD = _NOUS_FEATURED_THRESHOLD
+_MODEL_PICKER_VISIBLE_TARGET = _NOUS_FEATURED_TARGET
+_OPENROUTER_FREE_TIER_AUGMENT_CAP = 30
 
 # Vendor-prefix priority order for featured selection. Lower index = picked
 # earlier when sampling the live catalog. Reflects which vendors users have
@@ -1674,6 +1679,71 @@ def _build_nous_featured_set(
     return chosen, extras
 
 
+def _strip_picker_provider_hint(model_id: str) -> str:
+    mid = str(model_id or "").strip()
+    if mid.startswith("@") and ":" in mid:
+        return mid[mid.index(":") + 1 :]
+    return mid
+
+
+def _model_matches_picker_selection(
+    model_id: str,
+    selected_model_id: str | None,
+    provider_id: str | None = None,
+) -> bool:
+    selected = str(selected_model_id or "").strip()
+    candidate = str(model_id or "").strip()
+    if not selected or not candidate:
+        return False
+    if candidate == selected:
+        return True
+
+    selected_bare = _strip_picker_provider_hint(selected)
+    candidate_bare = _strip_picker_provider_hint(candidate)
+    if selected_bare != candidate_bare:
+        return False
+
+    selected_provider = ""
+    if selected.startswith("@") and ":" in selected:
+        selected_provider = selected[1 : selected.index(":")].lower()
+    candidate_provider = str(provider_id or "").strip().lower()
+    if candidate.startswith("@") and ":" in candidate:
+        candidate_provider = candidate[1 : candidate.index(":")].lower()
+
+    return not selected_provider or not candidate_provider or selected_provider == candidate_provider
+
+
+def _split_picker_overflow_models(
+    ordered_models: list[dict],
+    *,
+    selected_model_id: str | None = None,
+    provider_id: str | None = None,
+    threshold: int = _MODEL_PICKER_OVERFLOW_THRESHOLD,
+    target: int = _MODEL_PICKER_VISIBLE_TARGET,
+) -> tuple[list[dict], list[dict]]:
+    """Split an ordered picker catalog into visible rows plus an overflow tail."""
+    models = [copy.deepcopy(m) for m in (ordered_models or []) if isinstance(m, dict) and m.get("id")]
+    if len(models) <= threshold:
+        return models, []
+
+    visible = models[:target]
+    extras = models[target:]
+    if not selected_model_id:
+        return visible, extras
+
+    if any(_model_matches_picker_selection(m.get("id", ""), selected_model_id, provider_id) for m in visible):
+        return visible, extras
+
+    for idx, model in enumerate(extras):
+        if not _model_matches_picker_selection(model.get("id", ""), selected_model_id, provider_id):
+            continue
+        displaced = visible[-1]
+        visible[-1] = model
+        extras[idx] = displaced
+        break
+    return visible, extras
+
+
 def _apply_provider_prefix(
     raw_models: list[dict],
     provider_id: str,
@@ -1728,22 +1798,25 @@ def _deduplicate_model_ids(groups: list[dict]) -> None:
     if not groups:
         return
 
-    # Collect {model_id: [(group_idx, model_idx), ...]} in alphabetical
-    # provider_id order so that the "first occurrence stays unchanged" rule is
-    # deterministic across config edits (adding/removing/reordering providers).
+    # Collect {model_id: [(group_idx, bucket_name, model_idx), ...]} in
+    # alphabetical provider_id order so that the "first occurrence stays
+    # unchanged" rule is deterministic across config edits
+    # (adding/removing/reordering providers). Include ``extra_models`` too:
+    # slash-command resolution and picker filtering consume the full catalog.
     sorted_group_indices = sorted(
         range(len(groups)),
         key=lambda i: groups[i].get("provider_id", ""),
     )
-    id_map: dict[str, list[tuple[int, int]]] = {}
+    id_map: dict[str, list[tuple[int, str, int]]] = {}
     for gi in sorted_group_indices:
         group = groups[gi]
-        for mi, model in enumerate(group.get("models", [])):
-            mid = str(model.get("id", "") or "").strip()
-            # Skip IDs that are already provider-qualified.
-            if not mid or mid.startswith("@"):
-                continue
-            id_map.setdefault(mid, []).append((gi, mi))
+        for bucket_name in ("models", "extra_models"):
+            for mi, model in enumerate(group.get(bucket_name, []) or []):
+                mid = str(model.get("id", "") or "").strip()
+                # Skip IDs that are already provider-qualified.
+                if not mid or mid.startswith("@"):
+                    continue
+                id_map.setdefault(mid, []).append((gi, bucket_name, mi))
 
     # For any ID appearing in 2+ groups, prefix all but the first occurrence.
     # This handles N>2 providers correctly: the loop iterates over all
@@ -1751,9 +1824,9 @@ def _deduplicate_model_ids(groups: list[dict]) -> None:
     for original_id, locations in id_map.items():
         if len(locations) < 2:
             continue
-        for gi, mi in locations[1:]:
+        for gi, bucket_name, mi in locations[1:]:
             group = groups[gi]
-            model = group["models"][mi]
+            model = group[bucket_name][mi]
             pid = group.get("provider_id", "")
             model["id"] = f"@{pid}:{original_id}"
             provider_name = group.get("provider", pid)
@@ -2185,7 +2258,15 @@ def resolve_model_provider(model_id: str) -> tuple:
         # If prefix does NOT match config provider, the user picked a cross-provider model
         # from the OpenRouter dropdown (e.g. config=anthropic but picked openai/gpt-5.4-mini).
         # In this case always route through openrouter with the full provider/model string.
-        if prefix in _PROVIDER_MODELS and prefix != config_provider:
+        # Exception (#4210): a custom provider (bare ``custom`` or named ``custom:<slug>``)
+        # is a vendor-routing proxy, not a first-party provider — its model ids commonly
+        # contain a known-provider prefix that the proxy uses for upstream routing, not
+        # an OpenRouter dropdown selection. Keep the request on the custom provider; the
+        # base_url-set sibling of this exception lives earlier in the ``config_base_url``
+        # branch (#3872).
+        _cp_lower_cross = (config_provider or "").strip().lower()
+        _is_custom_cross = _cp_lower_cross == "custom" or _cp_lower_cross.startswith("custom:")
+        if prefix in _PROVIDER_MODELS and prefix != config_provider and not _is_custom_cross:
             return model_id, "openrouter", None
 
     return model_id, config_provider, config_base_url
@@ -2482,6 +2563,49 @@ def _candidate_supports_reasoning(candidate: str) -> bool:
     return False
 
 
+def _nested_route_reasoning_denied(model: str) -> bool:
+    """Hard deny for nested Gemini gateway routes that must never show a reasoning toggle."""
+    lower = str(model or "").strip().lower()
+    if not lower:
+        return False
+    for prefix in ("vertex/gemini-", "gemini_cli/gemini-"):
+        if lower.startswith(prefix):
+            tail = lower[len(prefix) :]
+            if tail.startswith("embedding") or "image" in tail or "imagine" in tail:
+                return True
+    return False
+
+
+def _nested_gateway_route_reasoning(model: str) -> bool:
+    """Recognize nested ``vertex/gemini-`` and ``gemini_cli/gemini-`` routes on custom providers.
+
+    The slash-prefix heuristic list includes ``google/gemini-2`` but not gateway-prefixed
+    Gemini ids, so capable models behind custom aggregators stayed hidden.
+    """
+    lower = str(model or "").strip().lower()
+    if not lower:
+        return False
+    for prefix in ("vertex/gemini-", "gemini_cli/gemini-"):
+        if lower.startswith(prefix):
+            tail = lower[len(prefix) :]
+            if tail.startswith("embedding") or "image" in tail or "imagine" in tail:
+                return False
+            # Gemini thinking/reasoning controls are documented for the 2.5
+            # series and 3-era models only — 1.5 (and earlier) have no thinking
+            # support, so a reasoning selector on e.g. ``vertex/gemini-1.5-pro``
+            # would let a user pick an effort that the route then rejects.
+            # Version-gate the allow to the reasoning-capable families.
+            if (
+                tail == "2.5"
+                or tail.startswith(("2.5-", "2.5.", "3-", "3."))
+                or "thinking" in tail
+                or "reasoning" in tail
+            ):
+                return True
+            return False
+    return False
+
+
 def _filter_reasoning_efforts_for_provider(
     efforts: list[str],
     model_id: str,
@@ -2535,6 +2659,8 @@ def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
     )
     if any(model.startswith(prefix) for prefix in prefixes):
         return list(VALID_REASONING_EFFORTS)
+    if _nested_gateway_route_reasoning(model):
+        return list(VALID_REASONING_EFFORTS)
     # Named custom providers often rewrite model ids with dots, underscores, or
     # extra vendor namespaces. Normalize those shapes before applying family-level
     # reasoning heuristics so "deepseek.v3.2", "deepseek_v4_flash", and
@@ -2578,6 +2704,184 @@ def _models_dev_reasoning_efforts(model_id: str, provider_id: str) -> list[str] 
     return None
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib redirect handler that refuses to follow any redirect.
+
+    Used by the LM Studio reasoning probe so a 3xx from the probe URL can never
+    forward the ``Authorization`` header (the configured LM Studio key) to a
+    redirected, possibly attacker-controlled host. ``redirect_request``
+    returning ``None`` makes urllib raise the original 3xx as an ``HTTPError``,
+    which the probe swallows. (#3837 security review)
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _get_lmstudio_reasoning_probe_api_key() -> str | None:
+    """Resolve the LM Studio key for reasoning probes with WebUI precedence."""
+    config_data = cfg
+    model_cfg = config_data.get("model") or {}
+    if isinstance(model_cfg, dict):
+        active_provider = str(model_cfg.get("provider") or "").strip().lower()
+        model_key = str(model_cfg.get("api_key") or "").strip()
+        if active_provider == "lmstudio" and model_key:
+            return model_key
+
+    providers_cfg = config_data.get("providers") or {}
+    if isinstance(providers_cfg, dict):
+        lmstudio_cfg = providers_cfg.get("lmstudio") or {}
+        if isinstance(lmstudio_cfg, dict):
+            config_key = str(lmstudio_cfg.get("api_key") or "").strip()
+            if config_key:
+                return config_key
+
+    env_key = str(os.getenv("LM_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+
+    legacy_env_key = str(os.getenv("LMSTUDIO_API_KEY") or "").strip()
+    if legacy_env_key:
+        return legacy_env_key
+
+    return None
+
+
+def _lmstudio_reasoning_probe_options_fallback(
+    model: str,
+    base_url: str | None,
+    *,
+    api_key: str | None = None,
+    timeout: float = 5.0,
+) -> list[str]:
+    """Query LM Studio reasoning options without relying on hermes_cli."""
+    server_root = str(base_url or "").strip().rstrip("/")
+    if server_root.endswith("/v1"):
+        server_root = server_root[:-3].rstrip("/")
+    if not server_root or not model:
+        return []
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "hermes-webui-reasoning-probe",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request = urllib.request.Request(
+        server_root + "/api/v1/models",
+        headers=headers,
+        method="GET",
+    )
+    # SECURITY: never follow redirects on this probe. urllib re-sends request
+    # headers (including Authorization: Bearer <lmstudio key>) to the redirect
+    # target, so a 3xx from the probe URL could exfiltrate the configured
+    # LM Studio credential to an attacker-controlled host. A no-redirect opener
+    # turns any 3xx into an HTTPError we swallow below. (#3837 security review)
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    try:
+        with opener.open(request, timeout=timeout) as response:  # nosec B310
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        logger.debug(
+            "LM Studio reasoning probe at %s failed with HTTP %s",
+            server_root,
+            exc.code,
+        )
+        return []
+    except Exception as exc:
+        logger.debug("LM Studio reasoning probe at %s failed: %s", server_root, exc)
+        return []
+
+    raw_models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, list):
+        logger.debug(
+            "LM Studio reasoning probe at %s returned malformed payload",
+            server_root,
+        )
+        return []
+
+    for raw in raw_models:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("key") != model and raw.get("id") != model:
+            continue
+        caps = raw.get("capabilities")
+        reasoning = caps.get("reasoning") if isinstance(caps, dict) else None
+        opts = reasoning.get("allowed_options") if isinstance(reasoning, dict) else None
+        if isinstance(opts, list):
+            return [str(opt).strip().lower() for opt in opts if isinstance(opt, str)]
+        return []
+    return []
+
+
+def _lmstudio_model_reasoning_options(
+    model: str,
+    base_url: str | None,
+    *,
+    api_key: str | None = None,
+    timeout: float = 5.0,
+) -> list[str]:
+    """Prefer hermes_cli, but keep WebUI reasoning probes working without it.
+
+    SECURITY: when an ``api_key`` is being sent, always use the built-in
+    no-redirect fallback probe rather than ``hermes_cli``. The bundled CLI probe
+    uses a plain ``urllib.request.urlopen`` that follows redirects and re-sends
+    the ``Authorization`` header to the redirect target, which could leak the
+    configured LM Studio credential to another host. We can only guarantee
+    redirect safety for code we control, so credentialed probes go through
+    ``_lmstudio_reasoning_probe_options_fallback`` (no-redirect opener). Keyless
+    probes have no credential to leak, so they may use the richer CLI path.
+    (#3837 security review)
+    """
+    if api_key:
+        return _lmstudio_reasoning_probe_options_fallback(
+            model,
+            base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
+
+    try:
+        from hermes_cli.models import (
+            lmstudio_model_reasoning_options as _cli_lmstudio_model_reasoning_options,
+        )
+    except Exception:
+        return _lmstudio_reasoning_probe_options_fallback(
+            model,
+            base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
+
+    try:
+        return _cli_lmstudio_model_reasoning_options(
+            model,
+            base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
+    except (TypeError, AttributeError):
+        logger.warning(
+            "hermes_cli.lmstudio_model_reasoning_options has an unexpected signature; "
+            "falling back to the built-in LM Studio reasoning probe",
+            exc_info=True,
+        )
+        return _lmstudio_reasoning_probe_options_fallback(
+            model,
+            base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
+    except Exception:
+        return _lmstudio_reasoning_probe_options_fallback(
+            model,
+            base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
+
+
 def resolve_model_reasoning_efforts(
     model_id: str | None = None,
     provider_id: str | None = None,
@@ -2602,34 +2906,50 @@ def resolve_model_reasoning_efforts(
 
     hinted_model = _strip_provider_hint_for_reasoning(model)
 
-    try:
-        from hermes_cli.models import (
-            github_model_reasoning_efforts,
-            lmstudio_model_reasoning_options,
-        )
-    except Exception:
-        if provider in {"copilot", "github-copilot"}:
-            return _heuristic_reasoning_efforts(hinted_model, provider)
-    else:
-        if provider in {"copilot", "github-copilot"}:
-            return _filter_reasoning_efforts_for_provider(
-                github_model_reasoning_efforts(hinted_model), hinted_model, provider
-            )
+    if _nested_route_reasoning_denied(hinted_model):
+        return []
 
-        if provider == "lmstudio":
-            probe_base = resolved_base_url or _get_provider_base_url(provider)
-            opts = lmstudio_model_reasoning_options(hinted_model, probe_base)
-            normalized = [str(opt).strip().lower() for opt in opts if str(opt).strip()]
-            if not normalized or set(normalized).issubset({"off"}):
-                return []
-            level_opts = [opt for opt in normalized if opt in VALID_REASONING_EFFORTS]
-            if level_opts:
-                return _filter_reasoning_efforts_for_provider(
-                    level_opts, hinted_model, provider
-                )
-            if set(normalized).issubset({"off", "on"}):
-                return []
+    if provider in {"copilot", "github-copilot"}:
+        try:
+            from hermes_cli.models import github_model_reasoning_efforts
+        except Exception:
+            return _heuristic_reasoning_efforts(hinted_model, provider)
+        return _filter_reasoning_efforts_for_provider(
+            github_model_reasoning_efforts(hinted_model), hinted_model, provider
+        )
+
+    if provider == "lmstudio":
+        configured_base = _get_provider_base_url(provider)
+        probe_base = resolved_base_url or configured_base
+        # SECURITY: only forward the configured LM Studio credential when the
+        # probe target is the configured LM Studio endpoint. /api/reasoning
+        # accepts a caller-supplied base_url, so a request could otherwise point
+        # the probe at an arbitrary host and harvest the stored key. When the
+        # caller supplies a base_url that does not normalize to the configured
+        # one, probe it WITHOUT a key. (#3837 security review)
+        probe_key: str | None = None
+        if not resolved_base_url or (
+            configured_base
+            and _normalize_base_url_for_match(probe_base)
+            == _normalize_base_url_for_match(configured_base)
+        ):
+            probe_key = _get_lmstudio_reasoning_probe_api_key()
+        opts = _lmstudio_model_reasoning_options(
+            hinted_model,
+            probe_base,
+            api_key=probe_key,
+        )
+        normalized = [str(opt).strip().lower() for opt in opts if str(opt).strip()]
+        if not normalized or set(normalized).issubset({"off"}):
             return []
+        level_opts = [opt for opt in normalized if opt in VALID_REASONING_EFFORTS]
+        if level_opts:
+            return _filter_reasoning_efforts_for_provider(
+                level_opts, hinted_model, provider
+            )
+        if set(normalized).issubset({"off", "on"}):
+            return []
+        return []
 
     # _models_dev_reasoning_efforts already applies the provider/model filter
     # internally, so it is returned as-is here (filtering again would be
@@ -2807,7 +3127,78 @@ def set_reasoning_effort(
     )
 
 
-def set_hermes_default_model(model_id: str) -> dict:
+def _public_advanced_model_options(model_cfg: dict) -> dict:
+    """Return write-only-safe advanced options from a model config block."""
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    return {
+        "base_url": str(model_cfg.get("base_url") or "").strip(),
+        "timeout": model_cfg.get("timeout", ""),
+        "download_timeout": model_cfg.get("download_timeout", ""),
+        "max_concurrency": model_cfg.get("max_concurrency", ""),
+        "extra_body": model_cfg.get("extra_body") if isinstance(model_cfg.get("extra_body"), dict) else {},
+        "api_key_set": bool(str(model_cfg.get("api_key") or "").strip()),
+    }
+
+
+def _main_model_request_overrides(config_data: dict) -> dict:
+    """Return supported runtime request overrides for the main chat model."""
+    if not isinstance(config_data, dict):
+        return {}
+    model_cfg = config_data.get("model", {})
+    if not isinstance(model_cfg, dict):
+        return {}
+    overrides = {}
+    extra_body = model_cfg.get("extra_body")
+    if isinstance(extra_body, dict) and extra_body:
+        overrides["extra_body"] = copy.deepcopy(extra_body)
+    return overrides
+
+
+def _apply_advanced_model_options(model_cfg: dict, advanced: dict | None) -> None:
+    """Apply supported advanced model options to a config block in-place."""
+    if advanced is None:
+        return
+    if not isinstance(advanced, dict):
+        raise ValueError("advanced model options must be an object")
+    if "base_url" in advanced:
+        base_url = str(advanced.get("base_url") or "").strip().rstrip("/")
+        if base_url:
+            model_cfg["base_url"] = base_url
+        else:
+            model_cfg.pop("base_url", None)
+    for field in ("timeout", "download_timeout", "max_concurrency"):
+        if field in advanced:
+            coerced = _coerce_optional_positive_int(advanced.get(field), field)
+            if coerced == "":
+                model_cfg.pop(field, None)
+            elif coerced is not None:
+                model_cfg[field] = coerced
+    if "extra_body" in advanced:
+        extra_body = advanced.get("extra_body")
+        if isinstance(extra_body, str):
+            text = extra_body.strip()
+            try:
+                extra_body = json.loads(text) if text else {}
+            except json.JSONDecodeError as exc:
+                raise ValueError("extra_body must be valid JSON") from exc
+        if extra_body in (None, ""):
+            model_cfg.pop("extra_body", None)
+        elif isinstance(extra_body, dict):
+            if extra_body:
+                model_cfg["extra_body"] = extra_body
+            else:
+                model_cfg.pop("extra_body", None)
+        else:
+            raise ValueError("extra_body must be a JSON object")
+    if advanced.get("api_key_clear"):
+        model_cfg.pop("api_key", None)
+    api_key = str(advanced.get("api_key") or "").strip()
+    if api_key:
+        model_cfg["api_key"] = api_key
+
+
+def set_hermes_default_model(model_id: str, advanced: dict | None = None) -> dict:
     """Persist the Hermes default model in config.yaml and reload runtime config."""
     selected_model = str(model_id or "").strip()
     if not selected_model:
@@ -2858,6 +3249,8 @@ def set_hermes_default_model(model_id: str) -> dict:
             elif not persisted_provider.startswith("custom:"):
                 model_cfg.pop("base_url", None)
 
+        _apply_advanced_model_options(model_cfg, advanced)
+
         config_data["model"] = model_cfg
         _save_yaml_config_file(config_path, config_data)
     # Reload outside the lock — reload_config() acquires _cfg_lock itself.
@@ -2884,6 +3277,9 @@ AUX_TASK_SLOTS: tuple[str, ...] = (
  "mcp",
  "title_generation",
  "curator",
+ "kanban_decomposer",
+ "profile_describer",
+ "triage_specifier",
 )
 
 
@@ -2920,18 +3316,46 @@ def get_auxiliary_models() -> dict:
             "provider": str(entry.get("provider") or "auto").strip(),
             "model": str(entry.get("model") or "").strip(),
             "base_url": str(entry.get("base_url") or "").strip(),
+            "timeout": entry.get("timeout", ""),
+            "download_timeout": entry.get("download_timeout", ""),
+            "max_concurrency": entry.get("max_concurrency", ""),
+            "extra_body": entry.get("extra_body") if isinstance(entry.get("extra_body"), dict) else {},
+            "api_key_set": bool(str(entry.get("api_key") or "").strip()),
         })
 
     return {
         "tasks": tasks,
-        "main": {"provider": main_provider, "model": main_model},
+        "main": {
+            "provider": main_provider,
+            "model": main_model,
+            **_public_advanced_model_options(model_cfg),
+        },
     }
 
 
-def set_auxiliary_model(task: str, provider: str, model: str) -> dict:
+def _coerce_optional_positive_int(value, field: str):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return ""
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive integer") from exc
+    if number < 1:
+        raise ValueError(f"{field} must be a positive integer")
+    return number
+
+
+def set_auxiliary_model(task: str, provider: str, model: str, advanced: dict | None = None) -> dict:
     """Persist an auxiliary model assignment in config.yaml.
 
     Special case: task='__reset__' clears all auxiliary slots.
+    ``advanced`` may update per-slot fields surfaced behind the WebUI gear menu.
+    Sensitive api_key values are write-only: get_auxiliary_models() only reports
+    whether one is set.
     """
     if task != "__reset__" and task not in AUX_TASK_SLOTS:
         raise ValueError(
@@ -2971,6 +3395,12 @@ def set_auxiliary_model(task: str, provider: str, model: str) -> dict:
                         slot_cfg["base_url"] = str(resolved_base_url).strip().rstrip("/")
                 except Exception:
                     pass
+            if advanced is not None:
+                try:
+                    _apply_advanced_model_options(slot_cfg, advanced)
+                except ValueError as exc:
+                    msg = str(exc).replace("advanced model options", "advanced auxiliary options")
+                    raise ValueError(msg) from exc
             aux_cfg[task] = slot_cfg
             config_data["auxiliary"] = aux_cfg
 
@@ -3109,12 +3539,23 @@ def _configured_model_badges_from_static_catalog(
 
     def _norm_static_model_id(model_id: str) -> str:
         s = str(model_id or "").strip().lower()
+        stripped_at_provider = False
         if s.startswith("@") and ":" in s:
-            parts = s.split(":")
-            s = parts[-1] or s
-        if "://" not in s and "/" in s:
-            stripped = s.split("/", 1)[1]
-            s = stripped or s
+            colon_idx = s.index(":", 1)
+            candidate = s[colon_idx + 1:]
+            stripped_at_provider = bool(candidate)
+            s = candidate or s
+        if "://" not in s:
+            if (
+                not stripped_at_provider
+                and "/" in s
+                and ":" in s
+                and s.index(":") < s.index("/")
+            ):
+                s = s[s.index("/") + 1 :] or s
+            if "/" in s:
+                stripped = s.split("/", 1)[1]
+                s = stripped or s
         return s.replace("-", ".")
 
     norm_lookup: dict[str, list[str]] = {}
@@ -4332,16 +4773,28 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
 
         def _norm_model_id(model_id: str) -> str:
             s = str(model_id or "").strip().lower()
+            stripped_at_provider = False
             # Strip @provider: prefix (e.g., @custom:jingdong:GLM-5 -> GLM-5).
             # Defensive: if the last segment is empty (trailing colon, malformed
             # config), keep the original to avoid collapsing distinct IDs to ''.
             if s.startswith("@") and ":" in s:
-                parts = s.split(":")
-                s = parts[-1] or s
+                # Strip @provider: prefix, preserving remaining hierarchy including
+                # colon-suffixed model IDs like provider/model:free (#3959).
+                colon_idx = s.index(":", 1)
+                candidate = s[colon_idx + 1:]
+                stripped_at_provider = bool(candidate)
+                s = candidate or s
             # Skip slash-based stripping for URI-scheme IDs (e.g.
             # gpt://folder/model/latest) whose slashes are path separators,
             # not provider delimiters (#3429).
             if "://" not in s:
+                if (
+                    not stripped_at_provider
+                    and "/" in s
+                    and ":" in s
+                    and s.index(":") < s.index("/")
+                ):
+                    s = s[s.index("/") + 1 :] or s
                 # Strip only the first slash-segment (provider prefix), preserving
                 # any remaining vendor hierarchy.  Using parts[-1] here previously
                 # discarded ALL segments except the last, collapsing distinct
@@ -5123,6 +5576,47 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
 
         # 5. Build model groups
         if detected_providers:
+            _picker_selected_model_id = (
+                (model_cfg.get("model") if isinstance(model_cfg, dict) else None)
+                or default_model
+                or None
+            )
+
+            def _append_picker_group(
+                provider_label: str,
+                provider_id: str,
+                raw_models: list[dict] | None,
+                *,
+                models_endpoint_error: dict | None = None,
+                apply_prefix: bool = True,
+                decorate_overflow_label: bool = False,
+                allow_empty: bool = False,
+            ) -> None:
+                picker_models = copy.deepcopy(raw_models or [])
+                if apply_prefix:
+                    picker_models = _apply_provider_prefix(picker_models, provider_id, active_provider)
+                visible_models, extra_models = _split_picker_overflow_models(
+                    picker_models,
+                    selected_model_id=_picker_selected_model_id,
+                    provider_id=provider_id,
+                )
+                if not (visible_models or extra_models or models_endpoint_error or allow_empty):
+                    return
+                group_entry = {
+                    "provider": provider_label,
+                    "provider_id": provider_id,
+                    "models": visible_models,
+                }
+                if decorate_overflow_label and extra_models:
+                    group_entry["provider"] = (
+                        f"{provider_label} ({len(visible_models)} of {len(visible_models) + len(extra_models)})"
+                    )
+                if extra_models:
+                    group_entry["extra_models"] = extra_models
+                if models_endpoint_error:
+                    group_entry["models_endpoint_error"] = models_endpoint_error
+                groups.append(group_entry)
+
             for pid in sorted(detected_providers):
                 # Custom-provider PIDs are populated above via the
                 # _named_custom_groups branch (or skipped intentionally).
@@ -5148,10 +5642,13 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                         if not _nc_models:
                             _nc_models = auto_detected_models_by_provider.get(pid, [])
                         if _nc_models or pid in _named_custom_errors:
-                            group = {"provider": _nc_display, "provider_id": pid, "models": _nc_models}
-                            if pid in _named_custom_errors:
-                                group["models_endpoint_error"] = _named_custom_errors[pid]
-                            groups.append(group)
+                            _append_picker_group(
+                                _nc_display,
+                                pid,
+                                _nc_models,
+                                models_endpoint_error=_named_custom_errors.get(pid),
+                                apply_prefix=False,
+                            )
                     continue
                 provider_name = _effective_provider_display_name(pid, _PROVIDER_DISPLAY)
                 if pid == "openrouter":
@@ -5191,10 +5688,10 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                             "https://openrouter.ai/api/v1/models",
                             headers={"Accept": "application/json"},
                         )
+                        free_tier_models = []
+                        selected_free_tier_model = None
                         with _urlreq.urlopen(_req, timeout=8.0) as _resp:
                             _payload = json.loads(_resp.read().decode())
-                        _free_count = 0
-                        _free_cap = 30  # don't drown the picker — top 30 free tier
                         for _item in _payload.get("data", []) or []:
                             if not isinstance(_item, dict):
                                 continue
@@ -5220,11 +5717,27 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                             _label = _name.split("/")[-1] if "/" in _name else _name
                             if "(free)" not in _label.lower():
                                 _label = f"{_label} (free)"
-                            seen_ids.add(_mid)
-                            raw_models.append({"id": _mid, "label": _label})
-                            _free_count += 1
-                            if _free_count >= _free_cap:
-                                break
+                            _entry = {"id": _mid, "label": _label}
+                            free_tier_models.append(_entry)
+                            if _model_matches_picker_selection(
+                                _mid,
+                                _picker_selected_model_id,
+                                "openrouter",
+                            ):
+                                selected_free_tier_model = _entry
+                        if len(free_tier_models) > _OPENROUTER_FREE_TIER_AUGMENT_CAP:
+                            free_tier_models = free_tier_models[:_OPENROUTER_FREE_TIER_AUGMENT_CAP]
+                            if (
+                                selected_free_tier_model
+                                and not any(
+                                    m.get("id") == selected_free_tier_model.get("id")
+                                    for m in free_tier_models
+                                )
+                            ):
+                                free_tier_models[-1] = selected_free_tier_model
+                        for _entry in free_tier_models:
+                            seen_ids.add(_entry["id"])
+                            raw_models.append(_entry)
                     except Exception:
                         logger.debug("OpenRouter free-tier live fetch unavailable; using fallback")
 
@@ -5238,13 +5751,7 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                             if m.get("provider") == "OpenRouter"
                         ]
 
-                    groups.append(
-                        {
-                            "provider": "OpenRouter",
-                            "provider_id": "openrouter",
-                            "models": raw_models,
-                        }
-                    )
+                    _append_picker_group("OpenRouter", "openrouter", raw_models)
                 elif pid == "ollama-cloud":
                     raw_models = []
                     try:
@@ -5258,14 +5765,7 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                         logger.warning("Failed to load Ollama Cloud models from hermes_cli")
 
                     if raw_models:
-                        models = _apply_provider_prefix(raw_models, pid, active_provider)
-                        groups.append(
-                            {
-                                "provider": provider_name,
-                                "provider_id": pid,
-                                "models": models,
-                            }
-                        )
+                        _append_picker_group(provider_name, pid, raw_models)
                 elif pid == "openai-codex":
                     # Codex account catalogs drift faster than WebUI releases
                     # (for example gpt-5.3-codex-spark in #1680). Ask the
@@ -5295,14 +5795,7 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                         raw_models = copy.deepcopy(_PROVIDER_MODELS.get("openai-codex", []))
 
                     if raw_models:
-                        models = _apply_provider_prefix(raw_models, pid, active_provider)
-                        groups.append(
-                            {
-                                "provider": provider_name,
-                                "provider_id": pid,
-                                "models": models,
-                            }
-                        )
+                        _append_picker_group(provider_name, pid, raw_models)
                 elif pid == "nous":
                     # Nous Portal exposes a curated catalog (~30 models on most
                     # accounts, up to several hundred for enterprise tiers) via
@@ -5319,8 +5812,6 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                     # decorated with the truncation count so users know more
                     # exists.
                     raw_models = []
-                    extra_models: list[dict] = []
-                    truncated_label_suffix = ""
                     live_fetch_failed = False
                     try:
                         from hermes_cli.models import provider_model_ids as _provider_model_ids
@@ -5332,39 +5823,15 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                         live_fetch_failed = True
 
                     if live_ids:
-                        # Sticky-selection signal: prefer the explicitly-active
-                        # model from cfg["model"]["model"] (what the user is
-                        # currently using) over cfg["model"]["default"] (the
-                        # configured default suggestion). Falls back to the
-                        # latter so first-load before any selection still works.
-                        _model_cfg = cfg.get("model", {})
-                        _selected = (
-                            (isinstance(_model_cfg, dict) and _model_cfg.get("model"))
-                            or default_model
-                            or None
-                        )
                         featured_ids, extras_ids = _build_nous_featured_set(
                             live_ids,
-                            selected_model_id=_selected,
+                            selected_model_id=_picker_selected_model_id,
                         )
-                        # Prefix every live id with "@nous:" so routing matches
-                        # the explicit-provider-hint branch of resolve_model_provider
-                        # (same convention as the curated static list — see
-                        # tests/test_nous_portal_routing.py for the invariant).
+                        ordered_ids = featured_ids + extras_ids
                         raw_models = [
                             {"id": f"@nous:{mid}", "label": _format_nous_label(mid)}
-                            for mid in featured_ids
+                            for mid in ordered_ids
                         ]
-                        extra_models = [
-                            {"id": f"@nous:{mid}", "label": _format_nous_label(mid)}
-                            for mid in extras_ids
-                        ]
-                        if extras_ids:
-                            # Show "(15 of 397)" so the user understands the picker
-                            # is showing a featured subset, not a broken short list.
-                            truncated_label_suffix = (
-                                f" ({len(featured_ids)} of {len(live_ids)})"
-                            )
                     elif not live_fetch_failed:
                         # Live-fetch returned an empty list AND did not raise —
                         # the user is gated as authenticated by detection above
@@ -5388,18 +5855,13 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                         raw_models = copy.deepcopy(_PROVIDER_MODELS.get("nous", []))
 
                     if raw_models:
-                        models = _apply_provider_prefix(raw_models, pid, active_provider)
-                        # Apply the same prefix transform to extras so /model
-                        # autocomplete sees consistent IDs across the two lists.
-                        extras = _apply_provider_prefix(extra_models, pid, active_provider) if extra_models else []
-                        group_entry = {
-                            "provider": provider_name + truncated_label_suffix,
-                            "provider_id": pid,
-                            "models": models,
-                        }
-                        if extras:
-                            group_entry["extra_models"] = extras
-                        groups.append(group_entry)
+                        _append_picker_group(
+                            provider_name,
+                            pid,
+                            raw_models,
+                            apply_prefix=False,
+                            decorate_overflow_label=True,
+                        )
                 elif pid == "lmstudio":
                     # LM Studio is a local server — fetch live loaded models via
                     # the OpenAI-compatible /v1/models endpoint (#WebUI).
@@ -5448,14 +5910,7 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                                 logger.debug("LM Studio /models fetch failed at %s", endpoint)
 
                     if raw_models:
-                        models = _apply_provider_prefix(raw_models, pid, active_provider)
-                        groups.append(
-                            {
-                                "provider": provider_name,
-                                "provider_id": pid,
-                                "models": models,
-                            }
-                        )
+                        _append_picker_group(provider_name, pid, raw_models)
                 elif (
                     pid in _PROVIDER_MODELS
                     or pid in _canonical_to_raw_provider_key
@@ -5496,14 +5951,7 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                     detected_models = auto_detected_models_by_provider.get(pid, [])
                     if detected_models and not raw_models:
                         raw_models = copy.deepcopy(detected_models)
-                    models = _apply_provider_prefix(raw_models, pid, active_provider)
-                    groups.append(
-                        {
-                            "provider": provider_name,
-                            "provider_id": pid,
-                            "models": models,
-                        }
-                    )
+                    _append_picker_group(provider_name, pid, raw_models)
                 else:
                     detected_models = auto_detected_models_by_provider.get(pid)
                     if detected_models:
@@ -5532,25 +5980,26 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                         # see every group's id rewritten to the FIRST
                         # provider's prefix, and labels accumulated every
                         # provider's name).
-                        groups.append(
-                            {
-                                "provider": provider_name,
-                                "provider_id": pid,
-                                "models": models_for_group,
-                            }
+                        _append_picker_group(
+                            provider_name,
+                            pid,
+                            models_for_group,
+                            apply_prefix=False,
                         )
                     elif pid == "custom" and cfg_base_url:
                         # Anonymous custom endpoint: /v1/models probe may have
                         # failed (e.g. llama-server, lightweight relay), but the
-                        # chat endpoint itself may still work.  Add the group
+                        # chat endpoint itself may still work. Add the group
                         # with an empty model list so the user can type a model
                         # ID manually rather than being blocked by a silent
                         # probe failure (#2542).
-                        groups.append({
-                            "provider": provider_name,
-                            "provider_id": pid,
-                            "models": [],
-                        })
+                        groups.append(
+                            {
+                                "provider": provider_name,
+                                "provider_id": pid,
+                                "models": [],
+                            }
+                        )
         else:
             if default_model:
                 label = _get_label_for_model(default_model, groups)
@@ -5579,7 +6028,12 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                     default_model,
                 )
             else:
-                all_ids_norm = {_norm_model_id(m["id"]) for g in groups for m in g.get("models", [])}
+                all_ids_norm = {
+                    _norm_model_id(m["id"])
+                    for g in groups
+                    for bucket_name in ("models", "extra_models")
+                    for m in g.get(bucket_name, [])
+                }
                 if _norm_model_id(default_model) not in all_ids_norm:
                     label = _get_label_for_model(default_model, groups)
                     target_display = (
@@ -6038,6 +6492,66 @@ STREAM_GOAL_RELATED: dict = {}  # stream_id -> bool: only evaluate goal for goal
 STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:` field on live SSE frames (stage-364)
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
 
+# ── Gateway capability cache ─────────────────────────────────────────────────
+# Probes /v1/capabilities once per base_url/api-key pair and caches the result
+# for 60 s so guarded-turn routing decisions do not add latency on every chat
+# turn.
+_GATEWAY_CAPS_CACHE: dict[tuple[str, str], dict] = {}
+_GATEWAY_CAPS_LOCK = threading.Lock()
+_GATEWAY_CAPS_TTL_S: float = 60.0
+
+
+def get_gateway_caps(base_url: str, api_key: str = "") -> dict:
+    """Return cached gateway capability flags, probing /v1/capabilities if stale."""
+    base_url = str(base_url or "").rstrip("/")
+    cache_key = (base_url, str(api_key or ""))
+    now = time.time()
+    probe_started_at = now
+    with _GATEWAY_CAPS_LOCK:
+        cached = _GATEWAY_CAPS_CACHE.get(cache_key)
+        if cached and now - cached.get("fetched_at", 0) < _GATEWAY_CAPS_TTL_S:
+            return cached
+    caps = {"approval_events": False, "run_approval_response": False, "fetched_at": 0.0}
+    try:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(f"{base_url}/v1/capabilities", headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = json.loads(resp.read(65536))
+        features = body.get("features") if isinstance(body, dict) else {}
+        if not isinstance(features, dict):
+            features = {}
+        caps["approval_events"] = bool(features.get("approval_events"))
+        caps["run_approval_response"] = bool(features.get("run_approval_response"))
+    except Exception:
+        pass
+    with _GATEWAY_CAPS_LOCK:
+        current = _GATEWAY_CAPS_CACHE.get(cache_key)
+        if current and current.get("fetched_at", 0) > probe_started_at:
+            return current
+        caps["fetched_at"] = time.time()
+        _GATEWAY_CAPS_CACHE[cache_key] = caps
+    return caps
+
+
+def gateway_supports_approval(base_url: str, api_key: str = "") -> bool:
+    """True only when the gateway advertises both approval_events and run_approval_response."""
+    caps = get_gateway_caps(base_url, api_key)
+    return bool(caps.get("approval_events") and caps.get("run_approval_response"))
+
+
+def invalidate_gateway_caps(base_url: str | None = None) -> None:
+    """Evict capability cache for base_url, or all entries when base_url is None."""
+    with _GATEWAY_CAPS_LOCK:
+        if base_url is None:
+            _GATEWAY_CAPS_CACHE.clear()
+        else:
+            normalized = str(base_url or "").rstrip("/")
+            for cache_key in [key for key in _GATEWAY_CAPS_CACHE if key[0] == normalized]:
+                _GATEWAY_CAPS_CACHE.pop(cache_key, None)
+
+
 # ── notify_on_complete agent-wakeup wiring ─────────────────────────────────
 # When terminal(notify_on_complete=true, background=true) fires, the process
 # registry pushes a completion event onto tools.process_registry.completion_queue.
@@ -6256,7 +6770,7 @@ _SETTINGS_DEFAULTS = {
     "hide_empty_state_suggestions": False,  # hide the default new-chat suggestion buttons
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
-    "show_cli_sessions": False,  # merge CLI sessions from state.db into the sidebar
+    "show_cli_sessions": True,  # merge CLI/TUI/messaging sessions from state.db into the sidebar by default (#3988); established installs are grandfathered OFF by the load_settings backfill
     "show_cron_sessions": False,  # surface cron sessions in the sidebar (subordinate to show_cli_sessions)
     "show_previous_messaging_sessions": False,  # show older Telegram/Discord/etc. reset segments
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
@@ -6289,6 +6803,7 @@ _SETTINGS_DEFAULTS = {
     "show_thinking": True,  # show/hide thinking/reasoning blocks in chat view
     "simplified_tool_calling": True,  # legacy compatibility; Worklog renderer remains enabled
     "terminal_auto_expand_on_output": False,  # auto-expand terminal panel when output arrives while collapsed
+    "workspace_todos_tab": False,  # show a Todos tab in the workspace panel (right side)
     "api_redact_enabled": True,  # redact sensitive data (API keys, secrets) from API responses
     "dashboard_plugins": {},  # plugin_name -> bool, opt-in per plugin (default off per PF-10b)
     "sidebar_density": "compact",  # compact | detailed
@@ -6397,6 +6912,26 @@ def load_settings() -> dict:
                         if k not in _SETTINGS_LEGACY_DROP_KEYS
                     }
                 )
+                # Grandfather established installs OFF for show_cli_sessions (#3988).
+                # The default flipped True so NEW users see CLI/TUI/messaging
+                # sessions without hunting for the toggle — but an existing user
+                # who never opted in should not have their sidebar silently change.
+                # Treat the install as established (and pin the old False default)
+                # when show_cli_sessions is absent AND the file already carries
+                # real user state — either onboarding was completed, or some
+                # setting OTHER than a not-yet-completed onboarding flag has been
+                # persisted. Keying on "has saved user state" (not just
+                # onboarding_completed) also covers a CLI-configured user who
+                # tweaked a WebUI setting before running the wizard. A genuinely
+                # new / still-mid-onboarding file falls through to the True default.
+                _established_keys = [
+                    k for k in stored
+                    if k not in ("show_cli_sessions", "onboarding_completed")
+                ]
+                if "show_cli_sessions" not in stored and (
+                    bool(stored.get("onboarding_completed")) or _established_keys
+                ):
+                    settings["show_cli_sessions"] = False
         except Exception:
             logger.debug("Failed to load settings from %s", SETTINGS_FILE)
     settings["theme"], settings["skin"] = _normalize_appearance(
@@ -6454,6 +6989,7 @@ _SETTINGS_BOOL_KEYS = {
     "notifications_enabled",
     "show_thinking",
     "terminal_auto_expand_on_output",
+    "workspace_todos_tab",
     "api_redact_enabled",
     "session_jump_buttons",
     "session_endless_scroll",
