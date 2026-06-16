@@ -9883,6 +9883,7 @@ function renderMessages(options){
   const worklogDetailDisclosureState=_captureWorklogDetailDisclosureState(inner);
   _programmaticScroll=true;
   inner.innerHTML='';
+  _programmaticScroll=false;
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
   const {message:referenceMessage, rawIdx:referenceMessageRawIdx}=_latestCompressionReferenceMessage(
     S.messages,
