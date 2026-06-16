@@ -9858,6 +9858,11 @@ def handle_post(handler, parsed) -> bool:
 
         return j(handler, apply_force_update(target))
 
+    if parsed.path == "/api/updates/sync-upstream":
+        from api.updates import sync_from_upstream
+
+        return j(handler, sync_from_upstream())
+
     if parsed.path == "/api/updates/summary":
         from api.updates import summarize_update_payload
 

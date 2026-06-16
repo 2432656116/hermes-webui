@@ -8013,6 +8013,50 @@ async function checkUpdatesNow(){
   }
 }
 
+async function syncFromUpstream(){
+  const btn=$('btnSyncUpstream');
+  const label=$('syncUpstreamLabel');
+  const spinner=$('syncUpstreamSpinner');
+  const status=$('checkUpdatesStatus');
+  if(!btn||!label) return;
+  btn.disabled=true;
+  if(spinner) spinner.style.display='';
+  if(label) label.textContent='Syncing...';
+  if(status) status.textContent='';
+  try {
+    const data=await api('/api/updates/sync-upstream',{method:'POST',body:'{}',timeoutMs:120000});
+    if(data.ok){
+      if(status){
+        status.textContent=data.up_to_date
+          ? (t('settings_up_to_date')||'Up to date')
+          : (t('settings_sync_done')||'Synced {count} commits').replace('{count}',data.commits_synced||0);
+        status.style.color='var(--success)';
+      }
+      if(data.restart_scheduled){
+        showToast('Restarting to apply updates...');
+        setTimeout(()=>location.reload(),2500);
+      }
+    } else {
+      if(status){
+        status.textContent=data.message||t('settings_sync_failed');
+        status.style.color='var(--error)';
+      }
+      if(data.conflict) showToast('Merge conflict — resolve manually','error');
+    }
+  } catch(e){
+    console.warn('[syncFromUpstream]',e);
+    let userMsg=t('settings_sync_failed')||'Sync failed';
+    if(e&&e.response){
+      try{const body=JSON.parse(e.response);if(body.error) userMsg=String(body.error).substring(0,120);}catch(_){}
+    }
+    if(status){status.textContent=userMsg;status.style.color='var(--error)';}
+  } finally {
+    btn.disabled=false;
+    if(spinner) spinner.style.display='none';
+    if(label) label.textContent=t('settings_sync_upstream');
+  }
+}
+
 // ── Auxiliary Models ──────────────────────────────────────────────────────────
 
 // Canonical auxiliary task slots with display names.

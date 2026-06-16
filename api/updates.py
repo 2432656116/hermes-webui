@@ -1498,3 +1498,171 @@ def _apply_update_inner(target):
         'target': target,
         'restart_scheduled': True,
     }
+
+
+def sync_from_upstream() -> dict:
+    """Fetch upstream (nesquena/hermes-webui), merge, push to origin, restart.
+
+    Implements the webui-update workflow from the browser:
+      1. git fetch upstream --tags
+      2. git merge upstream/master --no-edit (or --ff-only)
+      3. git push origin master (best-effort)
+      4. Schedule restart
+
+    Returns a dict with status, commits synced, and restart info.
+    """
+    import shlex
+
+    # Check upstream remote exists
+    upstream_url, ok = _run_git(['remote', 'get-url', 'upstream'], REPO_ROOT, timeout=5)
+    if not ok or not upstream_url:
+        return {
+            'ok': False,
+            'message': (
+                'No "upstream" remote configured. '
+                'Run: git -C ' + str(REPO_ROOT) + ' remote add upstream '
+                'https://github.com/nesquena/hermes-webui.git'
+            ),
+        }
+
+    # Check if active chat work is in flight
+    blocker = _restart_blocker_snapshot()
+    if blocker.get('restart_blocked'):
+        return _restart_blocked_response('webui', blocker)
+
+    if not _apply_lock.acquire(blocking=False):
+        return {'ok': False, 'message': 'Update already in progress'}
+
+    try:
+        # 1. Fetch upstream
+        local_before, _ = _run_git(['rev-parse', 'HEAD'], REPO_ROOT)
+        upstream_head, _ = _run_git(['rev-parse', 'upstream/master'], REPO_ROOT)
+
+        fetch_out, fetch_ok = _run_git(
+            ['fetch', 'upstream', '--quiet', '--tags', '--force'],
+            REPO_ROOT, timeout=30,
+        )
+        if not fetch_ok:
+            return {
+                'ok': False,
+                'message': (
+                    'Could not reach upstream (nesquena/hermes-webui). '
+                    'Check your internet connection and try again.'
+                ),
+            }
+
+        # 2. Check if upstream is ahead
+        upstream_after, _ = _run_git(['rev-parse', 'upstream/master'], REPO_ROOT)
+        if not upstream_after:
+            return {'ok': False, 'message': 'Could not resolve upstream/master'}
+
+        if local_before == upstream_after:
+            return {
+                'ok': True,
+                'message': 'Already up to date with upstream.',
+                'up_to_date': True,
+                'current': local_before[:8] if local_before else 'unknown',
+            }
+
+        # Get commit summary
+        log_out, _ = _run_git(
+            ['log', '--oneline', f'{local_before}..{upstream_after}'],
+            REPO_ROOT, timeout=5,
+        )
+        commits_behind = [l.strip() for l in (log_out.split('\n') if log_out else []) if l.strip()]
+
+        # 3. Merge upstream/master
+        status_out, status_ok = _run_git(
+            ['status', '--porcelain', '--untracked-files=no'], REPO_ROOT,
+        )
+        stashed = False
+        if status_out:
+            _, stash_ok = _run_git(
+                ['stash', 'push', '-m', 'hermes-upstream-sync-autostash'], REPO_ROOT,
+            )
+            if stash_ok:
+                stashed = True
+
+        merge_out, merge_ok = _run_git(
+            ['merge', 'upstream/master', '--no-edit'], REPO_ROOT, timeout=30,
+        )
+        if not merge_ok:
+            # Try to abort and restore
+            _run_git(['merge', '--abort'], REPO_ROOT, timeout=5)
+            if stashed:
+                _run_git(['stash', 'apply'], REPO_ROOT, timeout=5)
+                _run_git(['stash', 'drop'], REPO_ROOT, timeout=5)
+            return {
+                'ok': False,
+                'message': (
+                    'Merge conflict detected. Upstream changes conflict with '
+                    'local modifications. Please resolve manually or run: '
+                    'git -C ' + str(REPO_ROOT) + ' reset --hard upstream/master'
+                ),
+                'conflict': True,
+            }
+
+        # Restore stash if needed
+        if stashed:
+            apply_ok, _ = _run_git(['stash', 'apply'], REPO_ROOT, timeout=5)
+            if apply_ok:
+                _run_git(['stash', 'drop'], REPO_ROOT, timeout=5)
+
+        local_after, _ = _run_git(['rev-parse', 'HEAD'], REPO_ROOT)
+
+        # 4. Push to origin (fork) — best-effort
+        push_message = ''
+        try:
+            # Try using gh auth token for push
+            import subprocess as _sp
+            token_result = _sp.run(
+                ['gh', 'auth', 'token'],
+                capture_output=True, text=True, timeout=5,
+                env={**os.environ, 'HTTPS_PROXY': os.environ.get('HTTPS_PROXY', 'http://192.168.0.110:7897')},
+            )
+            if token_result.returncode == 0 and token_result.stdout.strip():
+                token = token_result.stdout.strip()
+                push_env = {
+                    **os.environ,
+                    'GIT_ASKPASS': 'true',
+                    'HTTPS_PROXY': os.environ.get('HTTPS_PROXY', 'http://192.168.0.110:7897'),
+                }
+                push_cmd = [
+                    'git', '-c',
+                    f'credential.helper=!f(){{ echo "username=2432656116"; echo "password={token}"; }}; f',
+                    'push', 'origin', 'master',
+                ]
+                push_result = _sp.run(
+                    push_cmd, cwd=str(REPO_ROOT), capture_output=True,
+                    text=True, timeout=30, env=push_env,
+                )
+                if push_result.returncode == 0:
+                    push_message = ' Pushed to fork.'
+                else:
+                    push_message = ' Push to fork failed (local merge succeeded).'
+            else:
+                push_message = ' gh auth token unavailable — push skipped.'
+        except Exception:
+            push_message = ' Push to fork skipped.'
+
+        # 5. Invalidate cache
+        with _cache_lock:
+            _update_cache['checked_at'] = 0
+
+        # 6. Schedule restart
+        _schedule_restart()
+
+        return {
+            'ok': True,
+            'message': (
+                f'Synced {len(commits_behind)} commits from upstream.'
+                + push_message
+            ),
+            'commits_synced': len(commits_behind),
+            'commits': commits_behind[:20],
+            'before': local_before[:8] if local_before else 'unknown',
+            'after': local_after[:8] if local_after else 'unknown',
+            'restart_scheduled': True,
+        }
+    finally:
+        _apply_lock.release()
