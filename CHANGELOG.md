@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.475] — 2026-06-17 — Release QJ (ElevenLabs TTS engine)
+
+### Added
+
+- **ElevenLabs is now selectable as a TTS engine in the WebUI (#3510).** Alongside Browser speech synthesis and Edge TTS, you can pick ElevenLabs for voice mode and message read-aloud. It uses the same credentials and voice you've already configured for the Hermes agent — `ELEVENLABS_API_KEY` (env, falling back to `~/.hermes/.env`) and `tts.elevenlabs.voice_id` / `model` from `config.yaml` — so there's nothing new to set up if the agent already has it (ElevenLabs is a built-in Hermes TTS provider). The endpoint validates the configured `voice_id` as a safe path segment, enforces the existing 5000-character cap and rate limit, and returns a clear error when no key is configured. Thanks @linux-fertxo.
+
 ## [v0.51.474] — 2026-06-17 — Release QI (reconcile WebUI session source flags)
 
 ### Fixed
