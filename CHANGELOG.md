@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Polished loading states when switching profiles.** Switching profiles used to leave the previous profile's conversation list and workspace file tree on screen until their data finished loading (~1s), with no feedback beyond a spinner on the profile chip. Both now show a clean, theme-aware loading skeleton the instant the switch begins — so you never see the wrong profile's content, and you get consistent loading feedback across the whole window. The skeleton mirrors the real layout (grouped single-line conversation rows; file-tree rows) and shimmers gently; it respects `prefers-reduced-motion` (static bars, no animation) and adapts to light/dark themes. Part of a phased effort to make profile switching faster and smoother (#4662, phase 1).
+
 ## [v0.51.587] — 2026-06-22 — Release UT (running-first session ordering in sidebar)
 
 ### Fixed
@@ -75,7 +79,6 @@
 
 - **The transcript no longer yanks you back to the bottom while you're reading mid-stream.** Scroll re-pinning now requires a deliberate move toward the bottom (and ignores tiny scroll jitter), so reading earlier messages during an active stream stays put instead of getting hijacked back to the latest token. Thanks @rodboev. (#4584, fixes #4295)
 - **No more accidental horizontal panning of the mobile transcript.** Wide content (long code lines, URLs) could let the message area pan sideways on phones; the transcript now clips horizontal overflow and wraps long words. Thanks @rodboev. (#4583, fixes #4553)
->>>>>>> baa5869e4 (stage #4577 (dso2ng): keep failed steer from cancelling active runs)
 
 ## [v0.51.575] — 2026-06-22 — Release UH (session-list perf for long histories)
 
