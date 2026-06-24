@@ -24,15 +24,23 @@ def _api_crons_branch() -> str:
 
 def test_api_crons_guards_missing_cron_module():
     """The /api/crons GET branch must wrap the cron.jobs import in a guard that
-    returns a graceful payload instead of letting ModuleNotFoundError 500."""
+    returns a graceful payload instead of letting ModuleNotFoundError 500 — but
+    only for a genuinely-absent cron package, not an internal import bug."""
     branch = _api_crons_branch()
     assert "from cron.jobs import list_jobs" in branch
-    assert "except ModuleNotFoundError" in branch, (
+    assert "except ModuleNotFoundError as exc" in branch, (
         "GET /api/crons must catch ModuleNotFoundError so the Tasks tab does not "
         "500 when the cron package is absent (#4768)."
     )
-    # The except path returns an empty list + an unavailable flag (not a re-raise).
+    # The except path returns an empty list + an unavailable flag (not a re-raise)
+    # ONLY for the genuinely-missing cron package...
     assert "cron_unavailable" in branch
+    assert 'exc.name in ("cron", "cron.jobs")' in branch, (
+        "Must only treat an absent cron package as unavailable; an internal "
+        "dependency ImportError of an existing cron/jobs.py must still surface."
+    )
+    # ...and re-raises everything else (a real cron bug is not swallowed).
+    assert "\n            raise" in branch
     # The try guards the import specifically (not some unrelated block).
     try_idx = branch.index("try:")
     import_idx = branch.index("from cron.jobs import list_jobs")

@@ -10221,10 +10221,15 @@ def handle_get(handler, parsed) -> bool:
         # #4768: in split-container / minimal Docker deployments the WebUI image may
         # not ship the agent's `cron` package on its import path. Degrade gracefully
         # (empty list + cron_unavailable flag) instead of 500ing the whole Task tab.
+        # Only treat a genuinely-absent cron package as "unavailable"; a
+        # ModuleNotFoundError whose missing module is an internal dependency of an
+        # existing cron/jobs.py is a real bug and must still surface.
         try:
             from cron.jobs import list_jobs
-        except ModuleNotFoundError:
-            return j(handler, {"jobs": [], "cron_unavailable": True})
+        except ModuleNotFoundError as exc:
+            if exc.name in ("cron", "cron.jobs"):
+                return j(handler, {"jobs": [], "cron_unavailable": True})
+            raise
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
