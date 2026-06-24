@@ -8,7 +8,6 @@ guard, so a ``ModuleNotFoundError`` bubbled up as a 500 and broke the whole tab.
 The fix degrades gracefully: an empty job list with a ``cron_unavailable`` flag.
 """
 import pathlib
-import re
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ROUTES = (REPO / "api" / "routes.py").read_text(encoding="utf-8")
