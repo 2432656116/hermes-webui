@@ -6130,6 +6130,7 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
         return primary_messages
     merged_messages = []
     seen_message_keys = set()
+    seen_messages_by_key = {}
     for msg in sorted(list(parent_messages) + list(primary_messages), key=lambda m: (
         float(m.get("timestamp") or 0),
         str(m.get("role") or ""),
@@ -6137,8 +6138,10 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
     )):
         key = _session_message_merge_key(msg)
         if key in seen_message_keys:
+            _merge_session_display_metadata(seen_messages_by_key.get(key), msg)
             continue
         seen_message_keys.add(key)
+        seen_messages_by_key[key] = msg
         merged_messages.append(msg)
     return merged_messages
 
@@ -6574,6 +6577,7 @@ from api.models import (
     merge_session_messages_append_only,
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
+    _merge_session_display_metadata,
     _session_message_merge_key,
     _session_message_visible_key,
     _is_empty_partial_activity_message,
