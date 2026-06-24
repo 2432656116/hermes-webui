@@ -14,6 +14,7 @@ from contextlib import closing
 from pathlib import Path
 
 import api.config as _cfg
+from api.compression_anchor import is_context_compression_marker
 from api.config import (
     SESSION_DIR, SESSION_INDEX_FILE, SESSIONS, SESSIONS_MAX,
     LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE, HOME,
@@ -24,6 +25,7 @@ from api.usage import prompt_cache_hit_percent
 from api.agent_sessions import (
     _is_continuation_session,
     is_cli_session_row,
+    normalize_agent_session_source,
     read_importable_agent_session_rows,
     read_session_lineage_metadata,
 )
@@ -391,10 +393,13 @@ def _append_recovered_turn_to_context(session, recovered: dict) -> None:
     context_messages = getattr(session, 'context_messages', None)
     if not isinstance(context_messages, list) or not context_messages:
         return
+    role = str(recovered.get('role') or '')
     recovered_text = " ".join(str(recovered.get('content') or '').split())
+    if not recovered_text and not recovered.get('tool_call_id') and not recovered.get('tool_calls'):
+        return
     if recovered_text:
         for existing in reversed(context_messages[-8:]):
-            if not isinstance(existing, dict) or existing.get('role') != 'user':
+            if not isinstance(existing, dict) or existing.get('role') != role:
                 continue
             existing_text = " ".join(str(existing.get('content') or '').split())
             if existing_text == recovered_text:
@@ -416,6 +421,9 @@ def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> 
         'timestamp': recovered_ts,
         '_recovered': True,
     }
+    pending_source = getattr(session, 'pending_user_source', None)
+    if pending_source and pending_source != 'webui':
+        recovered['_source'] = pending_source
     if session.pending_attachments:
         recovered['attachments'] = list(session.pending_attachments)
     session.messages.append(recovered)
@@ -621,6 +629,7 @@ class Session:
                  pending_user_message: str=None,
                  pending_attachments=None,
                  pending_started_at=None,
+                 pending_user_source: str=None,
                  context_messages=None,
                  compression_anchor_visible_idx=None,
                  compression_anchor_message_key=None,
@@ -640,11 +649,12 @@ class Session:
                 parent_session_id: str=None,
                 worktree_path=None,
                 worktree_branch=None,
-                worktree_repo_root=None,
-                worktree_created_at=None,
-                enabled_toolsets=None,
-                composer_draft=None,
-                **kwargs):
+                 worktree_repo_root=None,
+                 worktree_created_at=None,
+                 enabled_toolsets=None,
+                 composer_draft=None,
+                 anchor_activity_scenes=None,
+                 **kwargs):
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.title = title
         self.workspace = str(Path(workspace).expanduser().resolve())
@@ -668,6 +678,7 @@ class Session:
         self.pending_user_message = pending_user_message
         self.pending_attachments = pending_attachments or []
         self.pending_started_at = pending_started_at
+        self.pending_user_source = pending_user_source
         self.context_messages = context_messages if isinstance(context_messages, list) else []
         self.compression_anchor_visible_idx = compression_anchor_visible_idx
         self.compression_anchor_message_key = compression_anchor_message_key
@@ -699,6 +710,7 @@ class Session:
         self.read_only = bool(kwargs.get('read_only', False))
         self.enabled_toolsets = enabled_toolsets  # List[str] or None — per-session toolset override
         self.composer_draft = composer_draft if isinstance(composer_draft, dict) else {}
+        self.anchor_activity_scenes = anchor_activity_scenes if isinstance(anchor_activity_scenes, dict) else {}
         raw_message_count = kwargs.get('message_count')
         parsed_message_count = None
         if raw_message_count is not None:
@@ -743,7 +755,7 @@ class Session:
             'input_tokens', 'output_tokens', 'estimated_cost',
             'cache_read_tokens', 'cache_write_tokens',
             'personality', 'active_stream_id',
-            'pending_user_message', 'pending_attachments', 'pending_started_at',
+            'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
             'compression_anchor_summary', 'pre_compression_snapshot',
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
@@ -754,7 +766,7 @@ class Session:
             'parent_session_id',
             'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
             'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
-            'enabled_toolsets', 'composer_draft',
+            'enabled_toolsets', 'composer_draft', 'anchor_activity_scenes',
         ]
         meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
         meta['message_count'] = len(self.messages or [])
@@ -1434,15 +1446,19 @@ def _append_journaled_partial_output(
             if existing_idx is not None:
                 current_assistant_idx = existing_idx
                 assistant_started_at = None
+                if 0 <= existing_idx < len(session.messages):
+                    _append_recovered_turn_to_context(session, session.messages[existing_idx])
                 return existing_idx
         timestamp = int(assistant_started_at or time.time())
-        session.messages.append({
+        recovered_assistant = {
             'role': 'assistant',
             'content': content,
             'timestamp': timestamp,
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
-        })
+        }
+        session.messages.append(recovered_assistant)
+        _append_recovered_turn_to_context(session, recovered_assistant)
         current_assistant_idx = len(session.messages) - 1
         assistant_started_at = None
         appended_any = True
@@ -1912,6 +1928,7 @@ def _apply_core_sync_or_error_marker(
             session.pending_user_message = None
             session.pending_attachments = []
             session.pending_started_at = None
+            session.pending_user_source = None
             session.save(touch_updated_at=touch_updated_at)
             logger.info(
                 "Session %s: cleared stale pending state for completed stream %s without error marker",
@@ -1938,6 +1955,7 @@ def _apply_core_sync_or_error_marker(
         session.pending_user_message = None
         session.pending_attachments = []
         session.pending_started_at = None
+        session.pending_user_source = None
         session.messages.append(
             _build_recovery_marker_with_retry_hook(
                 recovered_output=recovered_output,
@@ -1992,6 +2010,7 @@ def _apply_core_sync_or_error_marker(
             session.pending_user_message = None
             session.pending_attachments = []
             session.pending_started_at = None
+            session.pending_user_source = None
             if recovered_output:
                 session.messages.append(
                     _interrupted_recovery_marker(
@@ -2039,6 +2058,7 @@ def _apply_core_sync_or_error_marker(
     session.pending_user_message = None
     session.pending_attachments = []
     session.pending_started_at = None
+    session.pending_user_source = None
     session.messages.append(
         _build_recovery_marker_with_retry_hook(
             recovered_output=recovered_output,
@@ -2295,12 +2315,39 @@ def _cache_has_stale_unsaved_user_tail(cached, disk_session) -> bool:
         return False
     cached_messages = getattr(cached, 'messages', None) or []
     disk_messages = getattr(disk_session, 'messages', None) or []
-    if len(cached_messages) <= len(disk_messages):
-        return False
     if _last_non_tool_role(cached_messages) != 'user':
         return False
     if _last_non_tool_role(disk_messages) != 'assistant':
         return False
+    if len(cached_messages) < len(disk_messages):
+        return True
+    if len(cached_messages) == len(disk_messages):
+        # Same-length divergence is still stale: a completed assistant turn can
+        # be persisted through a sibling Session object while this inactive LRU
+        # entry still ends on the optimistic/recovered user row.
+        #
+        # Keep this narrow: only evict when the shared prefix is the same and
+        # the cached user tail is not newer than the persisted assistant.  A
+        # genuine just-submitted user message can exist briefly before the
+        # stream id is attached, and that must not be replaced by older disk
+        # state.
+        cached_tail = _last_non_tool_message(cached_messages)
+        disk_tail = _last_non_tool_message(disk_messages)
+        cached_prefix = [
+            (_message_role(message), _message_content_text(message))
+            for message in cached_messages[:-1]
+        ]
+        disk_prefix = [
+            (_message_role(message), _message_content_text(message))
+            for message in disk_messages[:-1]
+        ]
+        if cached_prefix != disk_prefix:
+            return False
+        cached_tail_ts = _message_timestamp(cached_tail)
+        disk_tail_ts = _message_timestamp(disk_tail)
+        if cached_tail_ts is not None and disk_tail_ts is not None and cached_tail_ts > disk_tail_ts:
+            return False
+        return True
 
     cached_tail = _last_non_tool_message(cached_messages)
     previous_disk_user = None
@@ -2315,6 +2362,30 @@ def _cache_has_stale_unsaved_user_tail(cached, disk_session) -> bool:
     # A genuinely new concurrent user edit must stay in memory so stale-session
     # guards can report and preserve it.
     return _message_content_text(cached_tail) == _message_content_text(previous_disk_user)
+
+
+def _anchor_scene_record_keys(session) -> set[str]:
+    records = getattr(session, 'anchor_activity_scenes', None)
+    if not isinstance(records, dict):
+        return set()
+    return {str(key) for key, value in records.items() if key and isinstance(value, dict)}
+
+
+def _anchor_scene_records_updated_at(session) -> float:
+    records = getattr(session, 'anchor_activity_scenes', None)
+    if not isinstance(records, dict):
+        return 0.0
+    latest = 0.0
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        try:
+            updated_at = float(record.get('updated_at') or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        if updated_at > latest:
+            latest = updated_at
+    return latest
 
 
 def _cached_session_lags_disk(cached) -> bool:
@@ -2341,7 +2412,19 @@ def _cached_session_lags_disk(cached) -> bool:
     disk_count = _parse_nonnegative_int(getattr(disk_meta, '_metadata_message_count', None))
     if disk_count is None:
         disk_count = _lookup_index_message_count(sid)
-    return bool(disk_count is not None and disk_count > cached_count)
+    if disk_count is not None and disk_count > cached_count:
+        return True
+    if not getattr(cached, 'active_stream_id', None) and not getattr(cached, 'pending_user_message', None):
+        cached_scene_keys = _anchor_scene_record_keys(cached)
+        disk_scene_keys = _anchor_scene_record_keys(disk_meta)
+        if disk_scene_keys and not disk_scene_keys.issubset(cached_scene_keys):
+            return True
+        if (
+            disk_scene_keys
+            and _anchor_scene_records_updated_at(disk_meta) > _anchor_scene_records_updated_at(cached)
+        ):
+            return True
+    return False
 
 
 def get_session(sid, metadata_only=False):
@@ -2471,7 +2554,7 @@ def _profile_default_model_state(profile=None):
     return default_model or get_effective_default_model(), default_provider
 
 
-def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None):
+def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None):
     """Create a new in-memory session.
 
     The session lives in the SESSIONS dict only — no disk write happens until
@@ -2524,6 +2607,7 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         worktree_branch=wt.get('branch') if wt else None,
         worktree_repo_root=wt.get('repo_root') if wt else None,
         worktree_created_at=wt.get('created_at') if wt else None,
+        enabled_toolsets=enabled_toolsets,
     )
     with LOCK:
         SESSIONS[s.session_id] = s
@@ -3138,40 +3222,149 @@ def _sidebar_title_is_generic_webui(title: str | None) -> bool:
     return text.startswith(prefix) and text[len(prefix):].isdigit()
 
 
-def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
-    """Attach state.db compression lineage metadata used by sidebar collapse."""
+def _read_state_db_sidebar_overrides(db_path: Path, session_ids: set[str]) -> dict[str, dict]:
+    """Return cheap state.db source/title overrides for sidebar rows.
+
+    This intentionally does not chase lineage parents/children. It is used on
+    the /api/sessions hot path before CLI filtering so state.db can correct
+    stale JSON source flags without paying the full lineage-enrichment cost.
+    """
+    wanted = {str(sid) for sid in (session_ids or set()) if sid}
+    if not wanted or not db_path.exists():
+        return {}
     try:
-        metadata = read_session_lineage_metadata(
+        import sqlite3
+    except ImportError:
+        return {}
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            session_cols = {row[1] for row in cur.fetchall()}
+            if 'id' not in session_cols:
+                return {}
+            source_expr = 's.source' if 'source' in session_cols else 'NULL AS source'
+            session_source_expr = 's.session_source' if 'session_source' in session_cols else 'NULL AS session_source'
+            title_expr = 's.title' if 'title' in session_cols else 'NULL AS title'
+            overrides: dict[str, dict] = {}
+            ids = list(wanted)
+            chunk_size = 500
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i:i + chunk_size]
+                placeholders = ','.join('?' * len(chunk))
+                cur.execute(
+                    f"""
+                    SELECT s.id, {source_expr}, {session_source_expr}, {title_expr}
+                    FROM sessions s
+                    WHERE s.id IN ({placeholders})
+                    """,
+                    chunk,
+                )
+                for row in cur.fetchall():
+                    sid = str(row['id'])
+                    entry: dict[str, object] = {}
+                    state_title = str(row['title'] or '').strip()
+                    if state_title:
+                        entry['_state_db_title'] = state_title
+                    state_source = str(row['source'] or '').strip().lower()
+                    if state_source:
+                        entry['_state_db_source'] = state_source
+                        source_meta = normalize_agent_session_source(state_source)
+                        entry['_state_db_source_tag'] = state_source
+                        entry['_state_db_raw_source'] = source_meta.get('raw_source')
+                        entry['_state_db_session_source'] = source_meta.get('session_source')
+                        entry['_state_db_source_label'] = source_meta.get('source_label')
+                    if entry:
+                        overrides[sid] = entry
+            return overrides
+    except Exception:
+        return {}
+
+
+def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
+    """Apply state.db source/title overrides without full lineage enrichment."""
+    try:
+        metadata = _read_state_db_sidebar_overrides(
             _active_state_db_path(),
             {str(s.get('session_id')) for s in sessions if s.get('session_id')},
         )
     except Exception:
         return
+    _apply_sidebar_state_db_override_metadata(sessions, metadata)
+
+
+def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: dict[str, dict]) -> None:
+    for session in sessions:
+        sid = session.get('session_id')
+        if sid not in metadata:
+            continue
+        entry = dict(metadata[sid])
+        state_db_title = entry.pop('_state_db_title', None)
+        state_db_source = entry.pop('_state_db_source', None)
+        state_db_source_tag = entry.pop('_state_db_source_tag', None)
+        state_db_raw_source = entry.pop('_state_db_raw_source', None)
+        state_db_session_source = entry.pop('_state_db_session_source', None)
+        state_db_source_label = entry.pop('_state_db_source_label', None)
+        if state_db_source == 'webui':
+            session['source_tag'] = state_db_source_tag
+            session['raw_source'] = state_db_raw_source
+            session['session_source'] = state_db_session_source
+            session['source_label'] = state_db_source_label
+            session['is_cli_session'] = False
+        title = session.get('title')
+        if (
+            state_db_title
+            and state_db_title != title
+            and _sidebar_title_is_generic_webui(title)
+        ):
+            session['_state_db_title'] = state_db_title
+            session['display_title'] = state_db_title
+
+
+def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
+    """Attach state.db compression lineage metadata used by sidebar collapse.
+
+    Cap the DB lookup to the top-N most recent sessions to bound wall-clock
+    on power users with thousands of sessions. The sidebar paints chronologically
+    newest first; older sessions almost never have visible lineage to collapse
+    (parents are themselves stale and rarely surface in the same render).
+    Lineage enrichment for those is loaded lazily when the user opens the
+    history panel. Issue #38914 / 2026-06-21 triage: /api/sessions was spending
+    4.9s on lineage_metadata across 2400+ rows.
+    """
+    # 2026-06-21: configurable via env to ease A/B and rollback without a redeploy.
+    import os as _os
+    try:
+        _cap = int(_os.environ.get("HERMES_WEBUI_LINEAGE_TOP_N", "300"))
+    except (TypeError, ValueError):
+        _cap = 300
+    if _cap > 0 and len(sessions) > _cap:
+        candidates = sessions[:_cap]
+    else:
+        candidates = sessions
+    try:
+        metadata = read_session_lineage_metadata(
+            _active_state_db_path(),
+            {str(s.get('session_id')) for s in candidates if s.get('session_id')},
+        )
+    except Exception:
+        return
+    _apply_sidebar_state_db_override_metadata(sessions, metadata)
     for session in sessions:
         sid = session.get('session_id')
         if sid in metadata:
             entry = dict(metadata[sid])
-            state_db_title = entry.pop('_state_db_title', None)
-            state_db_source = entry.pop('_state_db_source', None)
-            state_db_source_tag = entry.pop('_state_db_source_tag', None)
-            state_db_raw_source = entry.pop('_state_db_raw_source', None)
-            state_db_session_source = entry.pop('_state_db_session_source', None)
-            state_db_source_label = entry.pop('_state_db_source_label', None)
-            session.update(entry)
-            if state_db_source == 'webui':
-                session['source_tag'] = state_db_source_tag
-                session['raw_source'] = state_db_raw_source
-                session['session_source'] = state_db_session_source
-                session['source_label'] = state_db_source_label
-                session['is_cli_session'] = False
-            title = session.get('title')
-            if (
-                state_db_title
-                and state_db_title != title
-                and _sidebar_title_is_generic_webui(title)
+            for key in (
+                '_state_db_title',
+                '_state_db_source',
+                '_state_db_source_tag',
+                '_state_db_raw_source',
+                '_state_db_session_source',
+                '_state_db_source_label',
             ):
-                session['_state_db_title'] = state_db_title
-                session['display_title'] = state_db_title
+                entry.pop(key, None)
+            session.update(entry)
 
 
 def _diag_stage(diag, name: str) -> None:
@@ -3182,7 +3375,7 @@ def _diag_stage(diag, name: str) -> None:
             pass
 
 
-def all_sessions(diag=None):
+def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     _diag_stage(diag, "all_sessions.active_streams")
     active_stream_ids = _active_stream_ids()
     # Phase C: try index first for O(1) read; fall back to full scan
@@ -3276,8 +3469,13 @@ def all_sessions(diag=None):
                 and not s.get('has_pending_user_message')
                 and not s.get('worktree_path')
             )]
-            _diag_stage(diag, "all_sessions.lineage_metadata")
-            _enrich_sidebar_lineage_metadata(result)
+            if include_lineage_metadata:
+                _diag_stage(diag, "all_sessions.lineage_metadata")
+                _enrich_sidebar_lineage_metadata(result)
+            else:
+                _diag_stage(diag, "all_sessions.state_db_overrides")
+                _apply_sidebar_state_db_overrides(result)
+                _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
             result = _prefer_fuller_snapshots_for_sidebar(result)
             sidebar_candidates = result
             visible_result = [s for s in sidebar_candidates if not _hide_from_default_sidebar(s)]
@@ -3317,8 +3515,13 @@ def all_sessions(diag=None):
         and not s.pending_user_message
         and not getattr(s, 'worktree_path', None)
     )]
-    _diag_stage(diag, "all_sessions.lineage_metadata")
-    _enrich_sidebar_lineage_metadata(result)
+    if include_lineage_metadata:
+        _diag_stage(diag, "all_sessions.lineage_metadata")
+        _enrich_sidebar_lineage_metadata(result)
+    else:
+        _diag_stage(diag, "all_sessions.state_db_overrides")
+        _apply_sidebar_state_db_overrides(result)
+        _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
     result = _prefer_fuller_snapshots_for_sidebar(result)
     sidebar_candidates = result
     visible_result = [s for s in sidebar_candidates if not _hide_from_default_sidebar(s)]
@@ -3801,9 +4004,85 @@ def _path_stat_cache_key(path):
         return None
 
 
+def _sqlite_content_fingerprint(db_path: Path):
+    """Return a commit-reliable content fingerprint for a state.db.
+
+    The stat-only key below (mtime_ns + size of the .db/-wal/-shm files) is NOT
+    reliable for cache invalidation: in WAL mode a commit lands in the -wal file,
+    and under fast sequential writes the (mtime_ns, size) of the sidecars can
+    COLLIDE with a previously cached stamp (same nanosecond bucket + a WAL frame
+    that lands at the same offset/size after a prior checkpoint truncation), so a
+    freshly-committed gateway/CLI session is intermittently served from the stale
+    Python cache. PRAGMA data_version does NOT help here either — read from a
+    fresh per-request connection it always reports that connection's own initial
+    value and never advances (verified). A cheap content fingerprint over the
+    sessions/messages tables, read on a fresh connection, DOES advance on every
+    commit (incl. external gateway writes) and is immune to mtime granularity.
+    Cost is a pair of indexed COUNT/MAX queries (sub-ms), far cheaper than the
+    full uncached session scan this key gates.
+    """
+    try:
+        if not Path(db_path).exists():
+            return None
+    except OSError:
+        return None
+    try:
+        import sqlite3
+        # Read-only + a tiny busy timeout: a fingerprint read must NEVER stall the
+        # /api/sessions hot path when state.db is briefly locked by a writer.
+        # On lock (or any error) we return None and the caller falls back to the
+        # cheap file-stat stamp, so correctness degrades gracefully to the prior
+        # behavior rather than blocking for the default multi-second busy timeout.
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, timeout=0.05
+            )
+        except Exception:
+            return None
+        try:
+            conn.execute("PRAGMA busy_timeout=50")
+            parts = []
+            for table in ("sessions", "messages"):
+                try:
+                    # MAX(rowid) is an O(1) index lookup (no table scan) and
+                    # advances on every INSERT. Pair it with the table's largest
+                    # rowid + a count-free total: we deliberately avoid COUNT(*)
+                    # which forces a full SCAN on large messages tables (~tens of
+                    # ms per sidebar refresh on a big store). MAX(rowid) misses a
+                    # pure DELETE-without-insert, but the file-stat fallback in
+                    # _sqlite_file_stat_cache_key still moves on a delete commit,
+                    # and a delete never makes a MISSING row appear (the flake we
+                    # fix is an ADDED row not showing up). It also misses a plain
+                    # `UPDATE sessions SET title/message_count` with no message
+                    # insert (state_sync.py sync) — those fall back to the stat
+                    # stamp + 5s TTL, i.e. the prior behavior (a title-only rename
+                    # can lag <=5s); no regression vs the old stat-only key.
+                    row = conn.execute(
+                        f"SELECT MAX(rowid) FROM {table}"
+                    ).fetchone()
+                    parts.append(row[0] if row else None)
+                except Exception:
+                    parts.append(None)
+            return tuple(parts)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
 def _sqlite_file_stat_cache_key(db_path: Path):
-    """Return a cheap invalidation key for a SQLite DB and WAL sidecars."""
+    """Return a commit-reliable invalidation key for a SQLite DB.
+
+    Combines a content fingerprint (the authoritative signal — advances on every
+    commit, immune to mtime-granularity collisions that flaked the gateway_sync
+    test) with the cheap file stat stamps as a belt-and-suspenders fallback for
+    the case where the fingerprint can't be read.
+    """
     return (
+        _sqlite_content_fingerprint(db_path),
         _path_stat_cache_key(db_path),
         _path_stat_cache_key(Path(f"{db_path}-wal")),
         _path_stat_cache_key(Path(f"{db_path}-shm")),
@@ -3898,6 +4177,22 @@ def _all_profiles_cli_contexts() -> tuple[list[tuple[Path, Path, str | None]], t
     return contexts, tuple(cache_entries)
 
 
+def _state_projection_sidecar_metadata(sid: str) -> dict:
+    """Return UI-owned metadata for a state.db-projected sidebar row."""
+    metadata = {"title": None, "archived": False}
+    try:
+        webui_meta = Session.load_metadata_only(sid)
+    except Exception:
+        return metadata
+    if not webui_meta:
+        return metadata
+    title = getattr(webui_meta, 'title', None)
+    if title:
+        metadata["title"] = title
+    metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
+    return metadata
+
+
 def _load_cli_sessions_uncached(
     hermes_home: Path,
     db_path: Path,
@@ -3965,15 +4260,14 @@ def _load_cli_sessions_uncached(
                 except Exception:
                     pass  # degrade gracefully
         # If a WebUI JSON file exists for this session (e.g. previously
-        # imported or renamed in the sidebar), prefer its title over the
-        # state.db title.  This fixes rename-not-persisting for CLI sessions
-        # after compression chain extension (#1486).
-        try:
-            _webui_meta = Session.load_metadata_only(sid)
-            if _webui_meta and getattr(_webui_meta, 'title', None):
-                _title = _webui_meta.title
-        except Exception:
-            pass
+        # imported or renamed in the sidebar), prefer its UI-owned metadata over
+        # the state.db projection. This keeps archived cron/tool/API runs hidden
+        # even when all_sessions() omits the hidden sidecar and the state row is
+        # re-injected from Hermes state.db (#4397).
+        _sidecar_meta = _state_projection_sidecar_metadata(sid)
+        if _sidecar_meta.get('title'):
+            _title = _sidecar_meta['title']
+        _archived = bool(_sidecar_meta.get('archived'))
         _display_title = _title or f'{_source.title()} Session'
         cli_sessions.append({
             'session_id': sid,
@@ -3984,7 +4278,7 @@ def _load_cli_sessions_uncached(
             'created_at': row['started_at'],
             'updated_at': raw_ts,
             'pinned': False,
-            'archived': False,
+            'archived': _archived,
             'project_id': _cron_pid() if is_cron_session(sid, _source) else None,
             'profile': profile,
             'source_tag': _source,
@@ -4054,12 +4348,10 @@ def _load_cli_sessions_uncached(
                                         break
                         except Exception:
                             pass
-                try:
-                    _webui_meta = Session.load_metadata_only(sid)
-                    if _webui_meta and getattr(_webui_meta, 'title', None):
-                        _title = _webui_meta.title
-                except Exception:
-                    pass
+                _sidecar_meta = _state_projection_sidecar_metadata(sid)
+                if _sidecar_meta.get('title'):
+                    _title = _sidecar_meta['title']
+                _archived = bool(_sidecar_meta.get('archived'))
                 _display_title = _title or 'Cron Session'
                 cli_sessions.append({
                     'session_id': sid,
@@ -4070,7 +4362,7 @@ def _load_cli_sessions_uncached(
                     'created_at': row['started_at'],
                     'updated_at': raw_ts,
                     'pinned': False,
-                    'archived': False,
+                    'archived': _archived,
                     'project_id': _cron_pid(),
                     'profile': profile_value,
                     'source_tag': 'cron',
@@ -4406,6 +4698,38 @@ def _session_message_merge_key(msg: dict):
     )
 
 
+_SESSION_MESSAGE_DISPLAY_METADATA_KEYS = (
+    "_turnDuration",
+    "_turnTps",
+    "_turnUsage",
+    "_firstTokenMs",
+    "_gatewayRouting",
+    "_statusCard",
+    "_anchor_stream_id",
+    "_anchor_activity_scene",
+)
+
+
+def _message_display_metadata_value_present(value) -> bool:
+    if value is None or value == "":
+        return False
+    if isinstance(value, (dict, list, tuple, set)) and not value:
+        return False
+    return True
+
+
+def _merge_session_display_metadata(target: dict | None, source: dict | None) -> None:
+    """Preserve display-only turn metadata when duplicate transcript rows merge."""
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+    for key in _SESSION_MESSAGE_DISPLAY_METADATA_KEYS:
+        if _message_display_metadata_value_present(target.get(key)):
+            continue
+        value = source.get(key)
+        if _message_display_metadata_value_present(value):
+            target[key] = copy.deepcopy(value)
+
+
 def _session_message_dedup_key(msg: dict):
     """Like _session_message_merge_key but preserves full-precision timestamp.
 
@@ -4532,6 +4856,41 @@ def _has_visible_duplicate(visible_key: tuple, visible_keys: set[tuple]) -> bool
     return _matching_visible_duplicate(visible_key, visible_keys) is not None
 
 
+def _sidecar_has_terminal_partial_error(sidecar_messages: list) -> bool:
+    """Return True when WebUI already owns an interrupted live partial turn.
+
+    After a cancelled/error terminal event, the WebUI sidecar contains the
+    user prompt, the streamed partial assistant prose/tool snapshot, and the
+    explicit terminal carrier. state.db may still contain the same run's raw
+    assistant/tool replay rows; appending those rows makes Compact Worklog show
+    duplicated process prose after cancel. In that shape, the sidecar is the
+    display owner.
+    """
+    messages = [msg for msg in (sidecar_messages or []) if isinstance(msg, dict)]
+    latest_error_idx = None
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role") or "").lower() != "assistant":
+            continue
+        if msg.get("_error"):
+            latest_error_idx = idx
+    if latest_error_idx is None:
+        return False
+    for msg in messages[latest_error_idx + 1 :]:
+        if str(msg.get("role") or "").lower() in ("user", "assistant"):
+            return False
+    segment_start = 0
+    for idx in range(latest_error_idx - 1, -1, -1):
+        if str(messages[idx].get("role") or "").lower() == "user":
+            segment_start = idx + 1
+            break
+    for msg in messages[segment_start:latest_error_idx]:
+        if str(msg.get("role") or "").lower() == "assistant" and msg.get("_partial"):
+            return True
+    return False
+
+
 def state_db_delta_after_context(sidecar_context: list, state_messages: list) -> list:
     """Return only state.db rows that are newer than model-facing context.
 
@@ -4593,6 +4952,176 @@ def state_db_delta_after_context(sidecar_context: list, state_messages: list) ->
     return state_messages[best_len:]
 
 
+def _normalized_compression_anchor_text(value) -> str:
+    return " ".join(str(value or "").split()).strip()[:160]
+
+
+def _compression_anchor_timestamp_as_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _context_messages_include_compression_marker(messages: list) -> bool:
+    for message in messages or []:
+        if not is_context_compression_marker(message):
+            continue
+        text = _message_content_text(message).lower().lstrip()
+        # Only prompt compaction summaries require fail-closed state.db replay.
+        # Other compression-adjacent summaries, such as Session Arc Summary,
+        # keep the existing prefix-delta behavior so fresh follow-ups survive.
+        if text.startswith("[context compaction") or text.startswith("context compaction"):
+            return True
+    return False
+
+
+def _state_db_anchor_index(state_messages: list, anchor_key) -> int | None:
+    if not isinstance(anchor_key, dict):
+        return None
+
+    anchor_role = str(anchor_key.get("role") or "").strip().lower()
+    anchor_text = _normalized_compression_anchor_text(anchor_key.get("text"))
+    anchor_attachments = anchor_key.get("attachments")
+    anchor_ts = _compression_anchor_timestamp_as_float(anchor_key.get("ts"))
+
+    if not anchor_role:
+        return None
+
+    # Do not attempt text-only fallback when timestamp is unavailable. Text-based
+    # fallback can match stale legacy rows if the anchor timestamp was lost,
+    # which can re-introduce old state.db rows after compaction.
+    if anchor_ts is None:
+        return None
+
+    if anchor_attachments in (None, ""):
+        expected_attachments = 0
+    else:
+        try:
+            expected_attachments = int(anchor_attachments)
+        except (TypeError, ValueError):
+            expected_attachments = 0
+
+    exact_timestamp_matches = []
+    for idx, message in enumerate(state_messages or []):
+        if _message_role(message) != anchor_role:
+            continue
+
+        attachments = message.get("attachments") if isinstance(message, dict) else None
+        attach_count = len(attachments) if isinstance(attachments, list) else 0
+        if attach_count != expected_attachments:
+            continue
+
+        # Attachment-only or timestamp-only anchors have no stable text payload.
+        # In that shape the timestamp + role + attachment count is the boundary;
+        # apply text comparison only when the anchor actually captured text.
+        message_text = _normalized_compression_anchor_text(_message_content_text(message))
+        if anchor_text and message_text != anchor_text:
+            continue
+
+        message_ts = _compression_anchor_timestamp_as_float(
+            message.get("timestamp") if isinstance(message, dict) else None
+        )
+        if message_ts is None:
+            continue
+        if abs(message_ts - anchor_ts) <= 1e-6:
+            exact_timestamp_matches.append(idx)
+            continue
+
+    if exact_timestamp_matches:
+        return exact_timestamp_matches[-1]
+    return None
+
+
+def _insert_state_message_chronologically(messages: list, msg: dict) -> bool:
+    """Insert a state.db-only row before newer sidecar rows when safe.
+
+    Returns False when the only chronological slot would resurrect an old state
+    row before the sidecar/context begins. This keeps no-watermark compression
+    display paths from reintroducing rows that were already compacted out.
+    """
+    timestamp = _message_timestamp_as_float(msg)
+    if timestamp is None:
+        messages.append(msg)
+        return True
+    idx = 0
+    while idx < len(messages):
+        existing = messages[idx]
+        existing_timestamp = _message_timestamp_as_float(existing)
+        should_insert = existing_timestamp is not None and (
+            existing_timestamp > timestamp
+            or (
+                existing_timestamp == timestamp
+                and msg.get("role") == "user"
+                and existing.get("role") == "assistant"
+            )
+        )
+        if not should_insert:
+            idx += 1
+            continue
+        if idx == 0 and existing_timestamp is not None and existing_timestamp > timestamp:
+            # With no surviving sidecar/context row before this slot, a real
+            # interruption rescue is indistinguishable from a compacted-out old
+            # prompt; prefer avoiding no-watermark resurrection in that shape.
+            return False
+        # Advance the insertion point past two kinds of slots that must not be
+        # split, applied to a fixpoint so they compose in any order at an
+        # equal-timestamp collision:
+        #   (a) an assistant(tool_calls) -> tool result block — inserting inside
+        #       it would split the tool call from its result (provider 400 /
+        #       corrupt tool context);
+        #   (b) a slot whose left neighbour shares this message's role at the
+        #       same timestamp — inserting there would re-order an already-matched
+        #       same-role turn (e.g. user, <inserted user>, assistant). The agent
+        #       core merges adjacent users before send, so (b) is benign in
+        #       practice, but advancing keeps the merged transcript correctly
+        #       ordered and alternation-clean regardless.
+        # Looping to a fixpoint guarantees the same-role guard can't strand the
+        # insert back inside a tool-pair (and vice versa).
+        while True:
+            advanced = False
+            # (a) Skip past a complete assistant(tool_calls) -> tool result
+            # block. Advance over ALL contiguous tool rows that belong to the
+            # preceding assistant's tool_calls, not just the first — a multi-tool
+            # turn has several adjacent tool results, and inserting between any of
+            # them splits the block (assistant, tool, <insert>, tool).
+            if (
+                idx < len(messages)
+                and messages[idx].get("role") == "tool"
+                and idx > 0
+                and messages[idx - 1].get("role") == "assistant"
+                and messages[idx - 1].get("tool_calls")
+            ):
+                while idx < len(messages) and messages[idx].get("role") == "tool":
+                    idx += 1
+                    advanced = True
+            # (b) Skip past an equal-timestamp run whose left neighbour shares
+            # this message's role — inserting there would re-order an
+            # already-matched same-role turn (user, <inserted user>, assistant).
+            # The agent core merges adjacent users before send, so this is benign
+            # in practice, but advancing keeps the merged transcript ordered.
+            while (
+                idx < len(messages)
+                and idx > 0
+                and messages[idx - 1].get("role") == msg.get("role")
+                and _message_timestamp_as_float(messages[idx]) == timestamp
+            ):
+                idx += 1
+                advanced = True
+            if not advanced:
+                break
+        messages.insert(idx, msg)
+        return True
+    messages.append(msg)
+    return True
+
+
 def merge_session_messages_append_only(
     sidecar_messages: list,
     state_messages: list,
@@ -4624,12 +5153,16 @@ def merge_session_messages_append_only(
         # collapsing same-second distinct turns would be worse than retaining
         # a compaction-restamped duplicate.
         seen = set()
+        seen_messages = {}
         deduped = []
         for msg in filtered:
             key = _session_message_dedup_key(msg)
             if key not in seen:
                 seen.add(key)
+                seen_messages[key] = msg
                 deduped.append(msg)
+            else:
+                _merge_session_display_metadata(seen_messages.get(key), msg)
         return deduped
 
     merged_messages = []
@@ -4638,9 +5171,21 @@ def merge_session_messages_append_only(
     seen_content_keys = set()
     seen_visible_keys = set()
     sidecar_visible_sequence = []
+    sidecar_visible_messages = []
     sidecar_visible_keys = set()
     sidecar_visible_counts = {}
+    merged_by_message_key = {}
+    merged_by_dedup_key = {}
+    merged_by_visible_key = {}
     max_sidecar_timestamp = None
+
+    def _remember_merged_message(message):
+        if not isinstance(message, dict):
+            return
+        merged_by_message_key.setdefault(_session_message_merge_key(message), message)
+        merged_by_dedup_key.setdefault(_session_message_dedup_key(message), message)
+        merged_by_visible_key.setdefault(_session_message_visible_key(message), message)
+
     for msg in sidecar_messages:
         timestamp = _message_timestamp_as_float(msg)
         if timestamp is not None:
@@ -4654,7 +5199,11 @@ def merge_session_messages_append_only(
         sidecar_visible_keys.add(visible_key)
         sidecar_visible_counts[visible_key] = sidecar_visible_counts.get(visible_key, 0) + 1
         sidecar_visible_sequence.append(visible_key)
+        sidecar_visible_messages.append(msg)
         merged_messages.append(msg)
+        _remember_merged_message(msg)
+    if _sidecar_has_terminal_partial_error(sidecar_messages):
+        return merged_messages
     sidecar_visible_lookup = _build_visible_duplicate_lookup(sidecar_visible_keys)
     state_replay_idx = 0
     skipped_state_visible_counts = {}
@@ -4663,14 +5212,17 @@ def merge_session_messages_append_only(
         key = _session_message_merge_key(msg)
         visible_key = _session_message_visible_key(msg)
         replays_sidecar_prefix = False
+        replay_target = None
         if state_replay_idx < len(sidecar_visible_sequence):
             expected_visible_key = sidecar_visible_sequence[state_replay_idx]
             if visible_key == expected_visible_key or _has_visible_duplicate(
                 visible_key, {expected_visible_key}
             ):
                 replays_sidecar_prefix = True
+                replay_target = sidecar_visible_messages[state_replay_idx]
                 state_replay_idx += 1
         if replays_sidecar_prefix:
+            _merge_session_display_metadata(replay_target, msg)
             matched_visible_key = _matching_visible_duplicate(
                 visible_key,
                 sidecar_visible_keys,
@@ -4728,6 +5280,7 @@ def merge_session_messages_append_only(
         # not.
         dedup_key = _session_message_dedup_key(msg)
         if dedup_key in seen_dedup_keys:
+            _merge_session_display_metadata(merged_by_dedup_key.get(dedup_key), msg)
             continue
         if max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
             # For message_id keys the merge key is authoritative — skip if
@@ -4735,6 +5288,7 @@ def merge_session_messages_append_only(
             # handled true duplicates; same-second distinct messages must
             # fall through.
             if key in seen_message_keys and key[0] == "message_id":
+                _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                 continue
             if not (isinstance(key, tuple) and key[:1] == ("message_id",)):
                 # Legacy key within sidecar timestamp range — only skip if
@@ -4743,8 +5297,10 @@ def merge_session_messages_append_only(
                 # identical content/timestamp, so an unchecked continue here
                 # would drop legitimately distinct turns.  (#3346 / PR #3665)
                 if key in seen_message_keys:
+                    _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                     continue
         if key in seen_message_keys and key[0] == "message_id":
+            _merge_session_display_metadata(merged_by_message_key.get(key), msg)
             continue
         matched_visible_key = _matching_visible_duplicate(
             visible_key,
@@ -4756,6 +5312,7 @@ def merge_session_messages_append_only(
             sidecar_count = sidecar_visible_counts.get(matched_visible_key, 0)
             if skipped_count < sidecar_count:
                 skipped_state_visible_counts[matched_visible_key] = skipped_count + 1
+                _merge_session_display_metadata(merged_by_visible_key.get(matched_visible_key), msg)
                 continue
         # State rows at or before the newest sidecar timestamp are normally
         # assumed to have already been observed by the sidecar. The <= gate
@@ -4784,14 +5341,25 @@ def merge_session_messages_append_only(
                 if _ck in seen_content_keys and dedup_key not in seen_dedup_keys:
                     pass  # different tool_calls from sidecar — preserve
                 else:
+                    _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                     continue
             else:
+                if msg.get("role") == "user" and _session_message_content_key(msg) not in seen_content_keys:
+                    if _insert_state_message_chronologically(merged_messages, msg):
+                        seen_message_keys.add(key)
+                        seen_dedup_keys.add(dedup_key)
+                        seen_content_keys.add(_session_message_content_key(msg))
+                        seen_visible_keys.add(visible_key)
+                        _remember_merged_message(msg)
+                    continue
+                _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                 continue
         seen_message_keys.add(key)
         seen_dedup_keys.add(dedup_key)
         seen_content_keys.add(_session_message_content_key(msg))
         seen_visible_keys.add(visible_key)
         merged_messages.append(msg)
+        _remember_merged_message(msg)
     return merged_messages
 
 
@@ -4802,15 +5370,35 @@ def reconciled_state_db_messages_for_session(
     if session is None:
         return []
     local_messages = []
+    using_context_messages = False
     if prefer_context:
         context_messages = getattr(session, 'context_messages', None)
         if isinstance(context_messages, list) and context_messages:
             local_messages = context_messages
+            using_context_messages = True
     if not local_messages:
         local_messages = getattr(session, 'messages', None) or []
     if state_messages is None:
         state_messages = get_state_db_session_messages(getattr(session, 'session_id', None))
     if prefer_context and local_messages:
+        if using_context_messages:
+            compressed_context = _context_messages_include_compression_marker(local_messages)
+            anchor_key = getattr(session, "compression_anchor_message_key", None)
+            if compressed_context:
+                if not anchor_key:
+                    logger.debug(
+                        "Compressed context for session %s has no compression anchor; using context_messages only",
+                        getattr(session, "session_id", None),
+                    )
+                    return list(local_messages)
+                anchor_index = _state_db_anchor_index(state_messages, anchor_key)
+                if anchor_index is None:
+                    logger.debug(
+                        "Compressed context for session %s has an unverifiable compression anchor; using context_messages only",
+                        getattr(session, "session_id", None),
+                    )
+                    return list(local_messages)
+                state_messages = list(state_messages or [])[anchor_index + 1 :]
         state_messages = state_db_delta_after_context(local_messages, state_messages)
     return merge_session_messages_append_only(
         local_messages,

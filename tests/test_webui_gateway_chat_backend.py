@@ -18,6 +18,7 @@ from api.gateway_chat import (
     _gateway_sse_reasoning_delta,
     _gateway_stream_usage,
     _gateway_tool_progress_event,
+    _gateway_use_runs_api_enabled,
     gateway_chat_config_status,
     webui_chat_backend_mode,
     webui_gateway_chat_enabled,
@@ -282,6 +283,7 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
 
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", "secret-token")
+    monkeypatch.setattr(gateway_chat, "_gateway_reasoning_effort_for_request", lambda *args, **kwargs: "high")
     monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {
         "status": "loaded",
         "source": "test",
@@ -329,6 +331,7 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert captured["headers"]["X-hermes-session-key"] == f"webui:{s.session_id}"
     assert '"stream": true' in captured["body"]
     payload = json.loads(captured["body"])
+    assert payload["reasoning_effort"] == "high"
     # #3324: the gateway path's first system message is now the full WebUI
     # ephemeral system prompt (progress prompt + session/delivery context),
     # NOT the bare _WEBUI_PROGRESS_PROMPT — otherwise the delivery/session
@@ -824,3 +827,148 @@ def test_gateway_chat_worker_forwards_image_attachments_as_multimodal_parts(tmp_
     assert content[0] == {"type": "text", "text": "What is in this image?"}
     assert content[1]["type"] == "image_url"
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_gateway_use_runs_api_is_default_off():
+    for env in ({}, {"HERMES_WEBUI_GATEWAY_USE_RUNS_API": ""}):
+        assert _gateway_use_runs_api_enabled({}, env) is False
+
+
+def test_gateway_use_runs_api_only_accepts_explicit_truthy_values():
+    for value in ("1", "true", "yes", "on", " True ", " ON "):
+        assert _gateway_use_runs_api_enabled({}, {"HERMES_WEBUI_GATEWAY_USE_RUNS_API": value}) is True
+
+
+def test_gateway_use_runs_api_rejects_generic_truthy_strings():
+    for value in ("enabled", "gateway", "api_server", "absolutely"):
+        assert _gateway_use_runs_api_enabled({}, {"HERMES_WEBUI_GATEWAY_USE_RUNS_API": value}) is False
+
+
+def test_gateway_use_runs_api_can_be_enabled_from_config():
+    assert _gateway_use_runs_api_enabled({"webui_gateway_use_runs_api": "true"}, {}) is True
+    assert _gateway_use_runs_api_enabled({"webui_gateway_use_runs_api": "1"}, {}) is True
+
+
+def test_gateway_use_runs_api_env_wins_over_config():
+    assert _gateway_use_runs_api_enabled(
+        {"webui_gateway_use_runs_api": "true"},
+        {"HERMES_WEBUI_GATEWAY_USE_RUNS_API": "false"},
+    ) is False
+
+
+def test_gateway_runs_api_body_includes_session_id():
+    """#4535: the runs API body must carry session_id so the agent reuses the
+    browser session instead of creating a fresh run_<uuid> per message."""
+    from unittest.mock import patch, MagicMock
+    from api.config import STREAMS, STREAMS_LOCK
+    from api.gateway_chat import _run_gateway_chat_streaming
+
+    captured = {}
+    events = []
+    q = MagicMock()
+    q.put_nowait = lambda item: events.append(item)
+    stream_id = "sid-runs-session-id"
+    with STREAMS_LOCK:
+        STREAMS[stream_id] = q
+
+    call_count = [0]
+
+    def fake_urlopen(req, *, timeout=None):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            captured["url"] = req.full_url
+            resp = MagicMock()
+            resp.read = lambda sz=65536: json.dumps({"run_id": "run_abc"}).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = lambda s, *a: None
+            return resp
+        resp = MagicMock()
+        resp.__iter__ = lambda s: iter([
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+            b'data: [DONE]\n',
+        ])
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda s, *a: None
+        return resp
+
+    import os
+    env = {k: v for k, v in os.environ.items()}
+    env["HERMES_WEBUI_CHAT_BACKEND"] = "gateway"
+    env["HERMES_WEBUI_GATEWAY_USE_RUNS_API"] = "1"
+    env["HERMES_WEBUI_GATEWAY_BASE_URL"] = "http://gateway.local"
+
+    try:
+        with patch.dict("os.environ", env, clear=True):
+            with patch("api.gateway_chat.gateway_supports_approval", return_value=True), \
+                 patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                 patch("api.gateway_chat.get_session", return_value=MagicMock(
+                     active_stream_id=stream_id, workspace="/tmp",
+                     profile=None, context_messages=[], messages=[],
+                 )):
+                _run_gateway_chat_streaming(
+                    session_id="sess-stable-uuid",
+                    msg_text="hi",
+                    model="test",
+                    workspace="/tmp",
+                    stream_id=stream_id,
+                )
+        assert "/v1/runs" in captured["url"]
+        assert captured["body"]["session_id"] == "sess-stable-uuid"
+    finally:
+        with STREAMS_LOCK:
+            STREAMS.pop(stream_id, None)
+
+
+def test_gateway_worker_skips_runs_api_when_opt_in_absent():
+    """Worker uses chat/completions even when gateway advertises approval support, unless opt-in is set."""
+    from unittest.mock import patch, MagicMock
+    from api.config import STREAMS, STREAMS_LOCK
+    from api.gateway_chat import _run_gateway_chat_streaming
+
+    events = []
+    q = MagicMock()
+    q.put_nowait = lambda item: events.append(item)
+    stream_id = "sid-optin-gate"
+    with STREAMS_LOCK:
+        STREAMS[stream_id] = q
+
+    sse_body = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+
+    def fake_urlopen(req, *, timeout=None):
+        assert "/v1/chat/completions" in req.full_url
+        resp = MagicMock()
+        resp.__iter__ = lambda s: iter(sse_body.split(b"\n"))
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda s, *a: None
+        return resp
+
+    import os
+    env_override = {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}
+    env_without_opt_in = {
+        k: v for k, v in os.environ.items()
+        if k != "HERMES_WEBUI_GATEWAY_USE_RUNS_API"
+    }
+    env_without_opt_in.update(env_override)
+
+    try:
+        with patch.dict("os.environ", env_without_opt_in, clear=True):
+            with patch("api.gateway_chat.gateway_supports_approval", return_value=True), \
+                 patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                 patch("api.gateway_chat.get_session", return_value=MagicMock(
+                     active_stream_id=stream_id, workspace="/tmp",
+                     profile=None, context_messages=[], messages=[],
+                 )):
+                _run_gateway_chat_streaming(
+                    session_id="sess-optin",
+                    msg_text="hi",
+                    model="test",
+                    workspace="/tmp",
+                    stream_id=stream_id,
+                )
+        event_types = [e[0] for e in events if isinstance(e, tuple) and len(e) >= 2]
+        assert "token" in event_types, "expected a token event from chat/completions path"
+        assert "apperror" not in event_types, "runs API path fired unexpectedly"
+    finally:
+        with STREAMS_LOCK:
+            STREAMS.pop(stream_id, None)

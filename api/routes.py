@@ -5,9 +5,12 @@ Extracted from server.py (Sprint 11) so server.py is a thin shell.
 
 import html as _html
 import copy
+import hashlib
+import errno
 import io
 import gzip
 import json
+from api.sse_chunked import end_sse_headers
 import logging
 import os
 import queue
@@ -16,6 +19,7 @@ import platform
 import shlex
 import shutil
 import sqlite3
+import stat as _stat
 import subprocess
 import sys
 import threading
@@ -426,8 +430,10 @@ def _visible_pinned_lineage_ids(session_rows) -> set[str]:
 # module keep resolving without per-call-site refactors.
 from api.profiles import (  # noqa: F401, E402  (re-export)
     _profiles_match,
+    _is_isolated_profile_mode,
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
+    get_active_hermes_home,
 )
 
 
@@ -439,6 +445,18 @@ def _all_profiles_query_flag(parsed_url) -> bool:
     """
     qs = parse_qs(parsed_url.query)
     raw = qs.get('all_profiles', [''])[0].strip().lower()
+    return raw in ('1', 'true', 'yes', 'on')
+
+
+def _all_profiles_enabled(parsed_url) -> bool:
+    """Enable aggregate profile reads only when the request asks and mode allows it."""
+    return _all_profiles_query_flag(parsed_url) and not _is_isolated_profile_mode()
+
+
+def _query_flag(parsed_url, name: str) -> bool:
+    """Return True for a truthy query flag value."""
+    qs = parse_qs(parsed_url.query)
+    raw = qs.get(name, [''])[0].strip().lower()
     return raw in ('1', 'true', 'yes', 'on')
 
 
@@ -949,6 +967,206 @@ def _load_gateway_session_identity_map() -> dict[str, dict]:
     return mapping.copy()
 
 
+def _gateway_status_payload() -> dict:
+    import datetime
+
+    identity_map = _load_gateway_session_identity_map()
+    sessions_path = _gateway_session_metadata_path()
+
+    # Detect whether the gateway process is alive, independent of connected
+    # messaging platforms. An empty identity_map means zero connected
+    # platforms, not necessarily a stopped gateway.
+    health = build_agent_health_payload()
+    alive = health.get("alive")
+    details = health.get("details") if isinstance(health.get("details"), dict) else {}
+    health_reason = details.get("reason")
+    health_state = details.get("state")
+    health_gateway_state = details.get("gateway_state")
+    if alive is True:
+        running = True
+        configured = True
+    elif alive is False:
+        running = False
+        configured = True
+    else:
+        gateway_running_metadata = (
+            health_reason == "gateway_stale_running_state"
+            or health_gateway_state == "running"
+        )
+        configured = True if gateway_running_metadata else bool(identity_map)
+        running = bool(identity_map)
+
+    platforms_set: set[str] = set()
+    for meta in identity_map.values():
+        raw = meta.get("raw_source") or meta.get("platform") or ""
+        norm = _normalize_messaging_source(raw)
+        if norm:
+            platforms_set.add(norm)
+    platform_labels = {
+        "telegram": "Telegram",
+        "discord": "Discord",
+        "slack": "Slack",
+        "email": "Email",
+        "web": "Web",
+        "api": "API",
+    }
+    platforms = sorted(
+        [{"name": p, "label": platform_labels.get(p, p.title())} for p in platforms_set],
+        key=lambda x: x["label"],
+    )
+    last_active = ""
+    if running and sessions_path.exists():
+        try:
+            mtime = sessions_path.stat().st_mtime
+            last_active = datetime.datetime.fromtimestamp(mtime).isoformat()
+        except Exception:
+            pass
+    return {
+        "running": running,
+        "configured": configured,
+        "platforms": platforms,
+        "last_active": last_active,
+        "session_count": len(identity_map),
+        "health": {
+            "state": health_state,
+            "reason": health_reason,
+            "gateway_state": health_gateway_state,
+        },
+    }
+
+
+_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS = 60
+
+# Server-side single-flight guard for gateway lifecycle actions. The client
+# disables its button while a request is in flight, but a scripted authed
+# client could still fire overlapping start/stop/restart calls, spawning
+# concurrent `hermes gateway` subprocesses. Serialize them here (mirrors the
+# self-update _apply_lock pattern): a non-blocking acquire returns 409 on
+# contention rather than launching a second overlapping subprocess.
+_GATEWAY_ACTION_LOCK = threading.Lock()
+
+
+def _run_gateway_lifecycle_command(action: str) -> subprocess.CompletedProcess:
+    if action not in {"start", "stop", "restart"}:
+        raise ValueError("unsupported gateway action")
+
+    from api import config as api_config
+    from api.profiles import get_active_profile_name
+
+    agent_dir = getattr(api_config, "_AGENT_DIR", None)
+    if not agent_dir:
+        raise FileNotFoundError("Hermes agent checkout not found")
+    agent_dir = Path(agent_dir).expanduser().resolve()
+    main_py = agent_dir / "hermes_cli" / "main.py"
+    if not main_py.exists():
+        raise FileNotFoundError("Hermes agent CLI entrypoint not found")
+
+    cmd = [str(getattr(api_config, "PYTHON_EXE", sys.executable)), str(main_py)]
+    profile_name = ""
+    try:
+        profile_name = str(get_active_profile_name() or "").strip()
+    except Exception as exc:
+        logger.debug("Could not resolve active profile for gateway lifecycle: %s", exc)
+    if profile_name and profile_name != "default":
+        cmd.extend(["--profile", profile_name])
+    cmd.extend(["gateway", action])
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("BROWSER", "echo")
+    return subprocess.run(
+        cmd,
+        cwd=str(agent_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS,
+    )
+
+
+def _handle_gateway_lifecycle(handler, action: str, body: dict):
+    del body  # Reserved for future per-gateway naming without changing the route contract.
+    # Reject overlapping lifecycle actions instead of spawning concurrent
+    # `hermes gateway` subprocesses (a non-blocking acquire — the action holds
+    # the lock for at most _GATEWAY_LIFECYCLE_TIMEOUT_SECONDS).
+    if action not in {"start", "stop", "restart"}:
+        return bad(handler, "unsupported gateway action", 400)
+    if not _GATEWAY_ACTION_LOCK.acquire(blocking=False):
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": "Another gateway action is already in progress; try again shortly.",
+                "action": action,
+            },
+            status=409,
+        )
+    try:
+        result = _run_gateway_lifecycle_command(action)
+    except ValueError as exc:
+        return bad(handler, str(exc), 400)
+    except FileNotFoundError as exc:
+        return j(handler, {"ok": False, "error": _sanitize_error(exc), "action": action}, status=500)
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "Gateway %s command timed out after %ss; stdout=%r stderr=%r",
+            action,
+            _GATEWAY_LIFECYCLE_TIMEOUT_SECONDS,
+            exc.stdout,
+            exc.stderr,
+        )
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": f"Gateway {action} timed out after {_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS} seconds",
+                "action": action,
+            },
+            status=504,
+        )
+    except Exception as exc:
+        logger.exception("Gateway %s command failed before completion", action)
+        return j(handler, {"ok": False, "error": _sanitize_error(exc), "action": action}, status=500)
+    finally:
+        _GATEWAY_ACTION_LOCK.release()
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        logger.warning(
+            "Gateway %s command failed with exit code %s; stdout=%r stderr=%r",
+            action,
+            result.returncode,
+            stdout,
+            stderr,
+        )
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": f"Gateway {action} failed with exit code {result.returncode}",
+                "action": action,
+                "returncode": result.returncode,
+            },
+            status=500,
+        )
+
+    return j(
+        handler,
+        {
+            "ok": True,
+            "action": action,
+            # Do NOT return captured stdout/stderr — the `hermes gateway` CLI
+            # prints service/PID/status details the browser shouldn't receive
+            # (mirrors the failure path, which already suppresses them). The
+            # frontend localizes its own success copy; the refreshed status
+            # payload carries the user-facing state.
+            "message": f"Gateway {action} completed.",
+            "status": _gateway_status_payload(),
+        },
+    )
+
+
 def _mark_cron_running(job_id: str):
     with _RUNNING_CRON_LOCK:
         _RUNNING_CRON_JOBS[job_id] = time.time()
@@ -1354,6 +1572,16 @@ def _clear_live_models_cache() -> None:
 # ── /api/sessions response cache (hot-sidebar response) ──────────────────────
 
 _SESSIONS_CACHE_TTL_SECONDS = 2.5
+# #4808: while a turn is actively streaming the frontend polls /api/sessions on a
+# fixed cadence (static/sessions.js `_streamingPollMs` = 5000ms). With the idle TTL
+# of 2.5s, every streaming poll lands in a fresh window and forces a full
+# all_sessions() rebuild on the hot path under the global store LOCK — pinning CPU
+# and starving token rendering on large stores (recurrence of #4672). Hold the
+# sidebar cache steady for longer than one poll interval while streaming; live
+# runtime state (active stream, sort order, pending flags) is overlaid on every
+# response regardless of cache (_session_list_cache_overlay_runtime_rows), and
+# structural/settings changes still evict immediately via the source stamp.
+_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 10.0
 _SESSIONS_CACHE_MAX_ENTRIES = 64
 _SESSIONS_CACHE_WAIT_SECONDS = 0.25
 _SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
@@ -1378,7 +1606,11 @@ def _session_list_cache_key(
     show_cli_sessions: bool,
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
+    include_archived: bool = False,
+    exclude_hidden: bool = False,
+    visible_only: bool = False,
     source_filter: str | None = None,
+    sidebar_source: str | None = None,
 ) -> tuple:
     return (
         _session_list_cache_profile_scope(active_profile),
@@ -1386,7 +1618,11 @@ def _session_list_cache_key(
         bool(show_cli_sessions),
         bool(show_previous_messaging_sessions),
         bool(show_cron_sessions),
+        bool(include_archived),
+        bool(exclude_hidden),
+        bool(visible_only),
         source_filter,
+        sidebar_source,
     )
 
 
@@ -1404,7 +1640,12 @@ def _session_list_cache_get(
         if stamp != current_stamp:
             _SESSIONS_CACHE.pop(key, None)
             return None, False
-        fresh = (now - ts) < _SESSIONS_CACHE_TTL_SECONDS
+        # #4808: widen the freshness window while a turn is streaming so the fixed
+        # 5s streaming poll cadence doesn't force a full rebuild on every poll.
+        ttl = _SESSIONS_CACHE_TTL_SECONDS
+        if _session_list_cache_streaming_freeze_marker() is not None:
+            ttl = _SESSIONS_CACHE_STREAMING_TTL_SECONDS
+        fresh = (now - ts) < ttl
         if fresh:
             _SESSIONS_CACHE.move_to_end(key)
             return copy.deepcopy(payload), True
@@ -1479,10 +1720,80 @@ def _session_list_cache_path_stamp(path: Path | None) -> tuple[int, int]:
         return (0, 0)
 
 
-def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]:
+def _session_list_cache_streaming_freeze_marker():
+    """Return a hold-down marker while any session is actively streaming, else None.
+
+    During an active chat turn the gateway/CLI writes message rows to state.db
+    continuously. Each write advances the WAL stat and the content fingerprint
+    (``MAX(rowid)`` of ``messages``) that ``_session_list_cache_source_stamp``
+    folds in, so the source stamp changes on essentially every ``/api/sessions``
+    poll — popping the cache and forcing a full ``all_sessions()`` rebuild
+    mid-stream. That rebuild then contends for the global ``LOCK`` the streaming
+    worker holds while writing, which is what drags token output down to
+    ~2 tok/s and produces the multi-second (and occasional ~15s) ``/api/sessions``
+    latencies in issue #4672.
+
+    The marker is keyed only on the *set* of active stream ids, not on any
+    per-write state, so:
+      * while the same turn(s) stream, the marker is constant → the cache holds
+        steady and rebuilds are bounded to the TTL cadence (one per
+        ``_SESSIONS_CACHE_TTL_SECONDS``) instead of one per poll;
+      * the instant a stream starts or stops, the active set changes → the
+        marker changes → the cache re-validates and the just-finished turn's
+        final title/message_count is picked up immediately.
+
+    Structural sidebar mutations (new/deleted/renamed/imported sessions,
+    attention, cron completion) do NOT rely on this stamp — they invalidate the
+    cache directly through the ``publish_session_list_changed`` listener — so the
+    only thing that can lag under the hold-down is a streaming session's own
+    title/message_count, which already tolerates a <=TTL refresh delay.
+    """
+    try:
+        active = _active_stream_ids()
+    except Exception:
+        return None
+    if not active:
+        return None
+    try:
+        return ("streaming", tuple(sorted(str(x) for x in active)))
+    except Exception:
+        return ("streaming",)
+
+
+def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], object, int]:
     _cache_profile, _cache_all_profiles, cache_show_cli_sessions, *_rest = key
     if not cache_show_cli_sessions:
-        return ((0, 0), (0, 0), (0, 0), (0, 0), (0, 0))
+        return ((0, 0), (0, 0), (0, 0), (0, 0), (0, 0), None, 0)
+    try:
+        settings_file = SETTINGS_FILE
+    except Exception:
+        settings_file = None
+    try:
+        from api.config import _SETTINGS_WRITE_VERSION
+        swv = _SETTINGS_WRITE_VERSION
+    except Exception:
+        swv = 0
+    # Streaming hold-down (#4672): while a turn is in flight, collapse the
+    # volatile state.db-derived components (db/WAL stat, gateway metadata, index
+    # stat, content fingerprint) to a marker that only changes when a stream
+    # starts or stops. This stops per-token message writes from busting the
+    # cache and triggering LOCK-contending rebuilds on every poll. The TTL still
+    # forces a periodic rebuild so the streaming session's own count/title stay
+    # fresh within the TTL window, and settings_file + the settings write
+    # version stay live so user-initiated sidebar/setting toggles invalidate
+    # immediately. Skipping the fingerprint's SQLite connect here also makes the
+    # streaming-path stamp strictly cheaper than the idle path.
+    streaming_marker = _session_list_cache_streaming_freeze_marker()
+    if streaming_marker is not None:
+        return (
+            streaming_marker,
+            streaming_marker,
+            streaming_marker,
+            streaming_marker,
+            _session_list_cache_path_stamp(settings_file),
+            streaming_marker,
+            swv,
+        )
     try:
         state_db_path = Path(_active_state_db_path())
     except Exception:
@@ -1499,17 +1810,29 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
         session_index_path = SESSION_DIR / "_index.json"
     except Exception:
         session_index_path = None
-    try:
-        settings_file = SETTINGS_FILE
-    except Exception:
-        settings_file = None
     return (
         _session_list_cache_path_stamp(state_db_path),
         _session_list_cache_path_stamp(state_db_wal_path),
         _session_list_cache_path_stamp(gateway_metadata_path),
         _session_list_cache_path_stamp(session_index_path),
         _session_list_cache_path_stamp(settings_file),
+        # Commit-reliable content fingerprint of state.db — the file-stat stamps
+        # above can collide under WAL-mode writes (same mtime_ns bucket + WAL
+        # frame size), so without this a freshly-committed CLI/gateway session
+        # could be served stale for the cache TTL. Mirrors the models-layer fix.
+        _session_list_cache_state_db_fingerprint(state_db_path),
+        swv,
     )
+
+
+def _session_list_cache_state_db_fingerprint(state_db_path: Path | None):
+    if state_db_path is None:
+        return None
+    try:
+        from api.models import _sqlite_content_fingerprint
+        return _sqlite_content_fingerprint(state_db_path)
+    except Exception:
+        return None
 
 
 def _session_list_cache_overlay_runtime_rows(rows: list[dict]) -> list[dict]:
@@ -1542,10 +1865,57 @@ def _session_list_cache_overlay_runtime_rows(rows: list[dict]) -> list[dict]:
             item["has_pending_user_message"] = bool(
                 getattr(live, "pending_user_message", None)
             )
+            for key in ("pending_started_at", "updated_at", "last_message_at"):
+                current = _session_list_row_numeric_value(item.get(key))
+                raw_live_value = getattr(live, key, None)
+                live_value = _session_list_row_numeric_value(raw_live_value)
+                if live_value > current:
+                    item[key] = raw_live_value
         stream_id = item.get("active_stream_id")
         item["is_streaming"] = bool(stream_id and stream_id in active_stream_ids)
         overlaid.append(item)
+    overlaid.sort(key=_session_list_runtime_sort_key, reverse=True)
     return overlaid
+
+
+def _session_list_row_numeric_value(value) -> float:
+    try:
+        numeric = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return numeric if numeric > 0 else 0.0
+
+
+def _session_list_row_timestamp(row: dict) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+    # Match the frontend `_sessionSortTimestampMs` semantics exactly (#4688 review):
+    # the idle base is the FIRST truthy of last_message_at -> updated_at -> created_at
+    # (NOT a flat max over all of them — a renamed/metadata-touched idle chat bumps
+    # updated_at without new messages and must not outrank a newer chatted session),
+    # then pending_started_at is overlaid only as the runtime promotion.
+    base = 0.0
+    for key in ("last_message_at", "updated_at", "created_at"):
+        base = _session_list_row_numeric_value(row.get(key))
+        if base > 0:
+            break
+    pending = _session_list_row_numeric_value(row.get("pending_started_at"))
+    return max(base, pending)
+
+
+def _session_list_row_is_runtime_active(row: dict) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if row.get("is_streaming"):
+        return True
+    return bool(row.get("active_stream_id") and row.get("has_pending_user_message"))
+
+
+def _session_list_runtime_sort_key(row: dict) -> tuple[int, float]:
+    return (
+        1 if _session_list_row_is_runtime_active(row) else 0,
+        _session_list_row_timestamp(row),
+    )
 
 
 def _session_list_cache_claim_rebuild(key: tuple) -> tuple[threading.Event, bool]:
@@ -1574,17 +1944,60 @@ def _build_session_list_cache_payload(
     show_cli_sessions: bool,
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
+    include_archived: bool = False,
+    exclude_hidden: bool = False,
+    visible_only: bool = False,
     source_filter: str | None = None,
+    sidebar_source: str | None = None,
     diag=None,
 ) -> dict:
     diag_stage = diag.stage if diag is not None else lambda *_a, **_k: None
 
+    def _session_has_server_visible_messages(session: dict) -> bool:
+        """Return True when a non-active sidebar row has a visibility signal.
+
+        Keep this mirror of the non-active server filter narrow and local to
+        route behavior so model-layer behavior remains unchanged.
+        """
+        if not isinstance(session, dict):
+            return False
+        if _numeric_count(session.get("message_count")) > 0:
+            return True
+
+        attention = session.get("attention")
+        if not (isinstance(attention, dict) and attention.get("kind")):
+            attention = _session_attention_summary(str(session.get("session_id") or ""))
+        if isinstance(attention, dict) and attention.get("kind"):
+            if _numeric_count(attention.get("count")) > 0:
+                return True
+
+        return bool(
+            session.get("is_streaming")
+            or session.get("active_stream_id")
+            or session.get("pending_user_message")
+            or session.get("has_pending_user_message")
+        )
+
+    def _all_sessions_for_sidebar():
+        try:
+            return all_sessions(diag=diag, include_lineage_metadata=False)
+        except TypeError as exc:
+            message = str(exc)
+            if (
+                "unexpected keyword argument" not in message
+                or "include_lineage_metadata" not in message
+            ):
+                raise
+            # Focused tests and third-party callers sometimes monkeypatch
+            # routes.all_sessions with the historical diag-only signature.
+            return all_sessions(diag=diag)
+
     diag_stage("all_sessions")
-    webui_sessions = all_sessions(diag=diag)
+    webui_sessions = _all_sessions_for_sidebar()
     diag_stage("reconcile_stale_stream_state")
     if _reconcile_stale_stream_state_for_session_rows(webui_sessions):
         diag_stage("all_sessions_after_stale_stream_reconcile")
-        webui_sessions = all_sessions(diag=diag)
+        webui_sessions = _all_sessions_for_sidebar()
     diag_stage("normalize_cli_rows")
     show_cli_sessions = bool(show_cli_sessions)
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
@@ -1595,12 +2008,12 @@ def _build_session_list_cache_payload(
         cli = get_cli_sessions(source_filter=source_filter, all_profiles=all_profiles)
         diag_stage("merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
-        # #3238: reconcile orphaned imported-CLI sidecars. When a CLI
-        # session was clicked in WebUI it gets a WebUI-owned sidecar that
-        # all_sessions() returns independently of state.db. If the user
-        # later deletes the backing CLI session from the command line,
-        # the sidecar is never pruned and the stale row lingers in the
-        # sidebar forever (there is no WebUI delete affordance for it).
+        # #3238/#4591: reconcile orphaned imported sidecars. When a CLI or
+        # API-server session is clicked in WebUI it gets a WebUI-owned sidecar
+        # that all_sessions() returns independently of state.db. If the user
+        # later deletes the backing agent session outside WebUI, the sidecar is
+        # never pruned and the stale row lingers in the sidebar forever (there
+        # is no WebUI delete affordance for read-only imported rows).
         # Drop rows whose backing agent row is genuinely gone. We probe
         # state.db directly (agent_session_rows_existing) rather than trust
         # cli_by_id absence, because get_cli_sessions() caps at
@@ -1614,7 +2027,7 @@ def _build_session_list_cache_payload(
             _sid = s.get("session_id")
             if (
                 _sid
-                and is_cli_session_row(s)
+                and (is_cli_session_row(s) or _is_api_server_sidecar_row(s))
                 and not _session_source_is_webui(s)
                 and _sid not in cli_by_id
             ):
@@ -1647,11 +2060,11 @@ def _build_session_list_cache_payload(
                         prune_session_from_index(_sid)
                     except Exception:
                         logger.debug(
-                            "Failed to prune orphaned CLI sidecar %s",
+                            "Failed to prune orphaned agent sidecar %s",
                             _sid,
                             exc_info=True,
                         )
-                    diag_stage("prune_orphaned_cli_sidecar")
+                    diag_stage("prune_orphaned_agent_sidecar")
                     continue
                 _kept_after_orphan_prune.append(s)
         webui_sessions = _kept_after_orphan_prune
@@ -1709,21 +2122,68 @@ def _build_session_list_cache_payload(
         other_profile_count = 0
     else:
         scoped = [s for s in merged if _profiles_match(s.get("profile"), active_profile)]
-        other_profile_count = len(merged) - len(scoped)
+        other_profile_count = 0 if _is_isolated_profile_mode() else len(merged) - len(scoped)
     diag_stage("messaging_dedupe")
-    scoped = _keep_latest_messaging_session_per_source(
-        scoped,
+    archived_scoped = _keep_latest_messaging_session_per_source(
+        list(scoped),
+        show_previous_messaging_sessions=show_previous_messaging_sessions,
+    )
+    visible_scoped = _keep_latest_messaging_session_per_source(
+        [s for s in scoped if not s.get("archived")],
         show_previous_messaging_sessions=show_previous_messaging_sessions,
     )
     if show_cli_sessions:
         diag_stage("cli_cap")
-        scoped = _cap_recent_cli_sessions(scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
+        archived_scoped = _cap_recent_cli_sessions(archived_scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
+        visible_scoped = _cap_recent_cli_sessions(visible_scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
+    if visible_only:
+        archived_scoped = [
+            s for s in archived_scoped if _session_has_server_visible_messages(s)
+        ]
+        visible_scoped = [
+            s for s in visible_scoped if _session_has_server_visible_messages(s)
+        ]
+    if exclude_hidden:
+        archived_scoped = [s for s in archived_scoped if not s.get("default_hidden")]
+        visible_scoped = [s for s in visible_scoped if not s.get("default_hidden")]
+    archived_webui_count = sum(
+        1 for s in archived_scoped
+        if s.get("archived") and not _is_cli_session_for_settings(s)
+    )
+    archived_cli_count = sum(
+        1 for s in archived_scoped
+        if s.get("archived") and _is_cli_session_for_settings(s)
+    )
+    archived_count = archived_webui_count + archived_cli_count
+    scoped = archived_scoped if include_archived else visible_scoped
+    webui_session_count = sum(
+        1 for s in scoped
+        if not _is_cli_session_for_settings(s)
+    )
+    cli_session_count = sum(
+        1 for s in scoped
+        if _is_cli_session_for_settings(s)
+    )
+    if sidebar_source == "webui":
+        scoped = [s for s in scoped if not _is_cli_session_for_settings(s)]
+    elif sidebar_source == "cli":
+        scoped = [s for s in scoped if _is_cli_session_for_settings(s)]
+    if not include_archived:
+        diag_stage("filter_archived_sessions")
+    diag_stage("visible_lineage_metadata")
+    _enrich_sidebar_lineage_metadata(scoped)
     return {
         "sessions": [
             dict(s) if isinstance(s, dict) else {}
             for s in scoped
         ],
         "cli_count": len(deduped_cli),
+        "archived_count": archived_count,
+        "archived_webui_count": archived_webui_count,
+        "archived_cli_count": archived_cli_count,
+        "webui_session_count": webui_session_count,
+        "cli_session_count": cli_session_count,
+        "include_archived": include_archived,
         "all_profiles": all_profiles,
         "active_profile": active_profile,
         "other_profile_count": other_profile_count,
@@ -1738,21 +2198,39 @@ def _build_session_list_cache_payload(
 def _session_list_payload_to_response(payload: dict) -> dict:
     safe_merged = []
     runtime_rows = _session_list_cache_overlay_runtime_rows(payload.get("sessions", []) or [])
+    # Read the redaction setting ONCE for the whole response and thread it through
+    # every row, instead of letting each row's _redact_text() re-read settings.json
+    # from disk (per title). The _sidebar_session_response_item -> _redact_text(_enabled=...)
+    # plumbing already exists; this wires the caller so the sidebar list path gets the
+    # same read-once optimization redact_session_data() already uses. On a large list
+    # this was the multi-second response_write stage in /api/sessions diagnostics. (#4662 Phase 3)
+    # load_settings is imported at module scope (below); this function only runs at
+    # request time, well after module load, so no lazy import is needed.
+    try:
+        _redact_enabled = bool(load_settings().get("api_redact_enabled", True))
+    except Exception:
+        _redact_enabled = True  # fail safe: redact when settings are unreadable
     for s in runtime_rows:
-        item = dict(s) if isinstance(s, dict) else {}
-        if isinstance(item.get("title"), str):
-            item["title"] = _redact_text(item["title"])
-        item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
+        item = _sidebar_session_response_item(s, redact_enabled=_redact_enabled) if isinstance(s, dict) else {}
         safe_merged.append(item)
-    return {
+    response = {
         "sessions": safe_merged,
         "cli_count": int(payload.get("cli_count", 0)),
+        "archived_count": int(payload.get("archived_count", 0)),
+        "archived_webui_count": int(payload.get("archived_webui_count", 0)),
+        "archived_cli_count": int(payload.get("archived_cli_count", 0)),
+        "include_archived": bool(payload.get("include_archived", False)),
         "all_profiles": bool(payload.get("all_profiles", False)),
         "active_profile": payload.get("active_profile"),
         "other_profile_count": int(payload.get("other_profile_count", 0)),
         "server_time": time.time(),
         "server_tz": time.strftime("%z"),
     }
+    if "webui_session_count" in payload:
+        response["webui_session_count"] = int(payload.get("webui_session_count", 0))
+    if "cli_session_count" in payload:
+        response["cli_session_count"] = int(payload.get("cli_session_count", 0))
+    return response
 
 
 def _get_cached_session_list_payload(
@@ -1868,6 +2346,7 @@ from api.config import (
     _resolve_cli_toolsets,
     _INDEX_HTML_PATH,
     get_available_models,
+    get_available_models_for_session_visit,
     _provider_is_known_or_configured,
     IMAGE_EXTS,
     MD_EXTS,
@@ -2027,6 +2506,8 @@ def _clear_stale_stream_state(session) -> bool:
                     original_stub.pending_attachments = []
                 if hasattr(original_stub, "pending_started_at"):
                     original_stub.pending_started_at = None
+                if hasattr(original_stub, "pending_user_source"):
+                    original_stub.pending_user_source = None
             except Exception:
                 pass
             return False
@@ -2066,6 +2547,8 @@ def _clear_stale_stream_state(session) -> bool:
                             original_stub.pending_attachments = []
                         if hasattr(original_stub, "pending_started_at"):
                             original_stub.pending_started_at = None
+                        if hasattr(original_stub, "pending_user_source"):
+                            original_stub.pending_user_source = None
                     except Exception:
                         pass
                 return True
@@ -2079,6 +2562,8 @@ def _clear_stale_stream_state(session) -> bool:
             session.pending_attachments = []
         if hasattr(session, "pending_started_at"):
             session.pending_started_at = None
+        if hasattr(session, "pending_user_source"):
+            session.pending_user_source = None
         try:
             # Runtime cleanup is not user activity; do not bubble old sessions
             # to the top of the sidebar just because a stale stream flag was
@@ -2100,6 +2585,8 @@ def _clear_stale_stream_state(session) -> bool:
                 original_stub.pending_attachments = []
             if hasattr(original_stub, "pending_started_at"):
                 original_stub.pending_started_at = None
+            if hasattr(original_stub, "pending_user_source"):
+                original_stub.pending_user_source = None
         except Exception:
             pass
     return True
@@ -2167,6 +2654,7 @@ def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
     current_activity_burst_id = 0
     fresh_segment = True
     last_ts = None
+    reasoning_first_tool_count: int | None = None
 
     def mark_boundary() -> int:
         nonlocal current_activity_burst_id
@@ -2225,6 +2713,21 @@ def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
             call["activitySegmentSeq"] = current_activity_burst_id
         tool_calls.append(call)
 
+    def reasoning_echo_tail_matches(text: str) -> bool:
+        candidate = _compact_for_echo_compare(text)
+        if not candidate:
+            return False
+        return _compact_for_echo_compare(reasoning_text).endswith(candidate)
+
+    def strip_reasoning_echo_tail(text: str) -> bool:
+        nonlocal reasoning_text, reasoning_first_tool_count
+        next_reasoning, did_remove = _strip_compact_echo_suffix(reasoning_text, text)
+        if did_remove:
+            reasoning_text = next_reasoning
+            if not _compact_for_echo_compare(reasoning_text):
+                reasoning_first_tool_count = None
+        return did_remove
+
     for event in events:
         event_name = str(event.get("event") or event.get("type") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -2236,11 +2739,16 @@ def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
                 fresh_segment = False
             continue
         if event_name == "reasoning":
-            reasoning_text += str(payload.get("text") or "")
+            text = str(payload.get("text") or "")
+            if text and reasoning_first_tool_count is None:
+                reasoning_first_tool_count = len(tool_calls)
+            reasoning_text += text
             continue
         if event_name == "interim_assistant":
             visible = str(payload.get("text") or "").strip()
             if visible:
+                if payload.get("reasoning_echo") or reasoning_echo_tail_matches(visible):
+                    strip_reasoning_echo_tail(visible)
                 if payload.get("already_streamed"):
                     if not assistant_text:
                         assistant_text = visible
@@ -2293,8 +2801,300 @@ def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
             message["_ts"] = last_ts
         messages.append(message)
 
-    if not messages and not tool_calls:
-        return None
+    def scene_group(segment_seq: int | None = None, burst_id: int | None = None) -> dict:
+        group: dict = {}
+        if segment_seq:
+            group["group_key"] = f"segment:{segment_seq}"
+            group["activity_segment_seq"] = segment_seq
+        elif burst_id:
+            group["group_key"] = f"burst:{burst_id}"
+            group["activity_burst_id"] = burst_id
+        else:
+            group["group_key"] = "activity:0"
+        if burst_id:
+            group["activity_burst_id"] = burst_id
+        return group
+
+    def scene_prose_row(text: str, *, burst_id: int | None, segment_seq: int, status: str) -> dict | None:
+        clean = str(text or "").strip()
+        if not clean:
+            return None
+        local_id = f"live-prose:{stream_id}:{segment_seq}"
+        return {
+            "row_id": local_id,
+            "order_index": len(anchor_activity_rows),
+            "kind": "process_prose",
+            "role": "prose",
+            "display_hint": "main_prose",
+            "display_hints": {
+                "compact_worklog": "main_prose",
+                "transparent_stream": "chronological_activity",
+            },
+            "source_event_type": "token",
+            "event_id": None,
+            "local_id": local_id,
+            "run_id": stream_id,
+            "stream_id": stream_id,
+            "seq": None,
+            "status": status,
+            "created_at": last_ts,
+            "identity": {
+                "event_id": None,
+                "local_id": local_id,
+                "run_id": stream_id,
+                "stream_id": stream_id,
+                "seq": None,
+            },
+            "group": scene_group(segment_seq, burst_id),
+            "text": clean,
+            "thinking": None,
+            "tool_call_id": "",
+            "tool": None,
+            "payload": {
+                "text": clean,
+                "activitySegmentSeq": segment_seq,
+                "activityBurstId": burst_id or 0,
+            },
+        }
+
+    def scene_thinking_row(text: str, *, status: str) -> dict | None:
+        clean = str(text or "").strip()
+        if not clean:
+            return None
+        preview = " ".join(clean.split())
+        local_id = f"live-thinking:{stream_id}:1"
+        return {
+            "row_id": local_id,
+            "order_index": len(anchor_activity_rows),
+            "kind": "reasoning",
+            "role": "thinking",
+            "display_hint": "collapsed_thinking",
+            "display_hints": {
+                "compact_worklog": "collapsed_thinking",
+                "transparent_stream": "chronological_activity",
+            },
+            "source_event_type": "reasoning",
+            "event_id": None,
+            "local_id": local_id,
+            "run_id": stream_id,
+            "stream_id": stream_id,
+            "seq": None,
+            "status": status,
+            "created_at": last_ts,
+            "identity": {
+                "event_id": None,
+                "local_id": local_id,
+                "run_id": stream_id,
+                "stream_id": stream_id,
+                "seq": None,
+            },
+            "group": scene_group(),
+            "text": clean,
+            "thinking": {
+                "text": clean,
+                "preview": (preview[:177] + "...") if len(preview) > 180 else preview,
+                "dedupe_key": f"thinking:{preview.lower()}" if preview else "",
+            },
+            "tool_call_id": "",
+            "tool": None,
+            "payload": {
+                "text": clean,
+            },
+        }
+
+    def scene_tool_row(call: dict, *, fallback_order: int) -> dict | None:
+        if not isinstance(call, dict):
+            return None
+        name = str(call.get("name") or "").strip()
+        if not name:
+            return None
+        tool_id = _run_journal_snapshot_tool_id(call)
+        burst_id = int(call.get("activityBurstId") or 0) or None
+        segment_seq = int(call.get("activitySegmentSeq") or burst_id or 0) or None
+        status = "error" if call.get("is_error") else ("completed" if call.get("done") else "running")
+        row_id = f"tool:{tool_id or name}:{fallback_order}"
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        preview = str(call.get("preview") or "")
+        snippet = str(call.get("snippet") or "")
+        tool = {
+            "id": tool_id,
+            "tid": tool_id,
+            "name": name,
+            "args": args,
+            "preview": preview,
+            "snippet": snippet,
+            "done": bool(call.get("done")),
+            "is_error": bool(call.get("is_error")),
+            "duration": call.get("duration"),
+            "started_at": call.get("started_at"),
+        }
+        payload = {
+            "name": name,
+            "args": args,
+            "preview": preview,
+            "snippet": snippet,
+            "tid": tool_id,
+            "id": tool_id,
+            "is_error": bool(call.get("is_error")),
+            "duration": call.get("duration"),
+            "activitySegmentSeq": segment_seq,
+            "activityBurstId": burst_id or 0,
+        }
+        return {
+            "row_id": row_id,
+            "order_index": len(anchor_activity_rows),
+            "kind": "tool_completed" if call.get("done") else "tool_started",
+            "role": "tool",
+            "display_hint": "tool_row",
+            "display_hints": {
+                "compact_worklog": "tool_row",
+                "transparent_stream": "chronological_activity",
+            },
+            "source_event_type": "tool_complete" if call.get("done") else "tool",
+            "event_id": None,
+            "local_id": tool_id or row_id,
+            "run_id": stream_id,
+            "stream_id": stream_id,
+            "seq": None,
+            "status": status,
+            "created_at": last_ts,
+            "identity": {
+                "event_id": None,
+                "local_id": tool_id or row_id,
+                "run_id": stream_id,
+                "stream_id": stream_id,
+                "seq": None,
+            },
+            "group": scene_group(segment_seq, burst_id),
+            "text": snippet or preview,
+            "thinking": None,
+            "tool_call_id": tool_id,
+            "tool": tool,
+            "payload": payload,
+        }
+
+    anchor_activity_rows: list[dict] = []
+    thinking_row_inserted = False
+    tool_rows_rendered = 0
+
+    def append_thinking_row(*, force: bool = False) -> None:
+        nonlocal thinking_row_inserted
+        if thinking_row_inserted:
+            return
+        if not force and reasoning_first_tool_count and tool_rows_rendered < reasoning_first_tool_count:
+            return
+        row = scene_thinking_row(reasoning_text, status="running")
+        if not row:
+            return
+        row["order_index"] = len(anchor_activity_rows)
+        anchor_activity_rows.append(row)
+        thinking_row_inserted = True
+
+    tool_rows_by_burst: dict[int, list[tuple[int, dict]]] = {}
+    ungrouped_tool_rows: list[tuple[int, dict]] = []
+    for order, call in enumerate(tool_calls):
+        burst_id = int(call.get("activityBurstId") or 0) if isinstance(call, dict) else 0
+        row = scene_tool_row(call, fallback_order=order)
+        if not row:
+            continue
+        if burst_id:
+            tool_rows_by_burst.setdefault(burst_id, []).append((order, row))
+        else:
+            ungrouped_tool_rows.append((order, row))
+
+    consumed_tools: set[int] = set()
+    text_start = 0
+    sorted_anchors = sorted(
+        [
+            anchor
+            for anchor in activity_burst_anchors
+            if int(anchor.get("textEnd") or 0) > 0
+        ],
+        key=lambda anchor: int(anchor.get("textEnd") or 0),
+    )
+    for anchor in sorted_anchors:
+        burst_id = int(anchor.get("id") or 0) or None
+        text_end = min(len(assistant_text), int(anchor.get("textEnd") or 0))
+        segment_seq = burst_id or (len(anchor_activity_rows) + 1)
+        prose = scene_prose_row(
+            assistant_text[text_start:text_end],
+            burst_id=burst_id,
+            segment_seq=segment_seq,
+            status="completed",
+        )
+        if prose:
+            anchor_activity_rows.append(prose)
+            append_thinking_row()
+        for order, row in tool_rows_by_burst.get(burst_id or 0, []):
+            row["order_index"] = len(anchor_activity_rows)
+            anchor_activity_rows.append(row)
+            consumed_tools.add(order)
+            tool_rows_rendered += 1
+            append_thinking_row()
+        text_start = max(text_start, text_end)
+
+    if text_start < len(assistant_text):
+        segment_seq = max(len(sorted_anchors) + 1, 1)
+        tail = scene_prose_row(
+            assistant_text[text_start:],
+            burst_id=None,
+            segment_seq=segment_seq,
+            status="running",
+        )
+        if tail:
+            anchor_activity_rows.append(tail)
+            append_thinking_row()
+
+    if not assistant_text:
+        append_thinking_row()
+
+    for order, row in sorted(ungrouped_tool_rows, key=lambda item: item[0]):
+        if order in consumed_tools:
+            continue
+        row["order_index"] = len(anchor_activity_rows)
+        anchor_activity_rows.append(row)
+        tool_rows_rendered += 1
+        append_thinking_row()
+
+    append_thinking_row(force=True)
+
+    # Keep a live anchor shell during session-switch replay even before the
+    # journal has projected visible prose or tool rows from the first events.
+    if not anchor_activity_rows and events:
+        anchor_activity_rows.append(
+            {
+                "row_id": f"lifecycle:{stream_id}:running",
+                "order_index": 0,
+                "kind": "lifecycle_status",
+                "role": "lifecycle",
+                "display_hint": "quiet_lifecycle_row",
+                "display_hints": {
+                    "compact_worklog": "quiet_lifecycle_row",
+                    "transparent_stream": "chronological_activity",
+                },
+                "source_event_type": "runtime_journal_snapshot",
+                "event_id": None,
+                "local_id": f"lifecycle:{stream_id}:running",
+                "run_id": stream_id,
+                "stream_id": stream_id,
+                "seq": None,
+                "status": "running",
+                "created_at": last_ts,
+                "identity": {
+                    "event_id": None,
+                    "local_id": f"lifecycle:{stream_id}:running",
+                    "run_id": stream_id,
+                    "stream_id": stream_id,
+                    "seq": None,
+                },
+                "group": scene_group(),
+                "text": "Working",
+                "thinking": None,
+                "tool_call_id": "",
+                "tool": None,
+                "payload": {},
+            }
+        )
 
     visible_anchors = [
         anchor
@@ -2320,6 +3120,9 @@ def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
         last_seq = summary_last_seq
         last_event_id = summary.get("last_event_id") or events[-1].get("event_id")
 
+    # Keep returning a live snapshot even when the journal has events but no
+    # projected message/tool rows yet. The frontend treats the empty activity
+    # scene as "nothing renderable yet" while preserving the live cursor.
     return {
         "session_id": session_id,
         "stream_id": stream_id,
@@ -2334,6 +3137,24 @@ def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
         "activity_burst_anchors": activity_burst_anchors,
         "current_activity_burst_id": current_activity_burst_id,
         "current_live_segment_seq": current_live_segment_seq,
+        "anchor_activity_scene": {
+            "version": "activity_scene_v1",
+            "mode": "compact_worklog",
+            "identity": {
+                "session_id": session_id,
+                "stream_id": stream_id,
+                "run_id": stream_id,
+                "source_message_refs": [],
+            },
+            "lifecycle": {
+                "status": "running",
+                "terminal_state": None,
+            },
+            "final_answer": "",
+            "final_message_ref": None,
+            "terminal_state": None,
+            "activity_rows": anchor_activity_rows,
+        },
     }
 
 
@@ -2356,6 +3177,702 @@ def _ensure_full_session_before_mutation(sid: str, session):
         while len(SESSIONS) > SESSIONS_MAX:
             SESSIONS.popitem(last=False)
     return full_session
+
+
+_ANCHOR_ACTIVITY_SCENE_MAX_BYTES = 256_000
+_ANCHOR_ACTIVITY_SCENE_MAX_ROWS = 1_000
+
+
+def _assistant_anchor_scene_message_ref(message) -> str:
+    if not isinstance(message, dict):
+        return ""
+    payload = _assistant_anchor_scene_message_ref_payload(message)
+    return _anchor_scene_message_ref_digest(payload)
+
+
+def _assistant_anchor_scene_message_ref_payload(message) -> dict:
+    role = str(message.get("role") or "")
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or part.get("input_text") or ""))
+            else:
+                parts.append(str(part or ""))
+        content_text = "\n".join(parts)
+    else:
+        content_text = str(content or "")
+    payload = {
+        "role": role,
+        "content": " ".join(content_text.split()),
+        "timestamp": message.get("_ts") or message.get("timestamp") or "",
+    }
+    return payload
+
+
+def _anchor_scene_message_ref_digest(payload: dict) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _sanitize_anchor_activity_scene(scene):
+    if not isinstance(scene, dict):
+        raise ValueError("scene must be an object")
+    if str(scene.get("version") or "") != "activity_scene_v1":
+        raise ValueError("scene.version must be activity_scene_v1")
+    rows = scene.get("activity_rows")
+    if not isinstance(rows, list):
+        raise ValueError("scene.activity_rows must be a list")
+    if len(rows) > _ANCHOR_ACTIVITY_SCENE_MAX_ROWS:
+        raise ValueError("scene.activity_rows is too large")
+    scene_copy = copy.deepcopy(scene)
+    encoded = json.dumps(scene_copy, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) > _ANCHOR_ACTIVITY_SCENE_MAX_BYTES:
+        raise ValueError("scene payload is too large")
+    return json.loads(encoded.decode("utf-8"))
+
+
+def _anchor_scene_int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _anchor_scene_message_index_from_request(body):
+    if not isinstance(body, dict):
+        return None
+    message_index = _anchor_scene_int_or_none(body.get("message_index"))
+    message_offset = _anchor_scene_int_or_none(body.get("message_offset"))
+    message_window_index = _anchor_scene_int_or_none(body.get("message_window_index"))
+    if (
+        message_window_index is not None
+        and message_offset is not None
+        and message_offset > 0
+        and (message_index is None or message_index == message_window_index)
+    ):
+        return message_window_index + message_offset
+    return message_index
+
+
+def _anchor_scene_candidate_matches_scene(candidate, scene) -> bool:
+    if not isinstance(scene, dict):
+        return True
+    final_key = _anchor_scene_text_key(scene.get("final_answer") or "")
+    if not final_key:
+        return True
+    candidate_key = _anchor_scene_text_key(_anchor_scene_message_text(candidate))
+    if not candidate_key:
+        return False
+    if candidate_key == final_key:
+        return True
+    if len(final_key) >= 16 and final_key in candidate_key:
+        return True
+    if len(candidate_key) >= 16 and candidate_key in final_key:
+        return True
+    return _anchor_scene_text_has_long_overlap(candidate_key, final_key)
+
+
+def _find_anchor_scene_message(messages, *, message_index=None, message_ref="", scene=None):
+    if not isinstance(messages, list):
+        return None, None
+    normalized_message_ref = _normalize_anchor_scene_message_ref(message_ref)
+    candidate = None
+    if isinstance(message_index, int) and 0 <= message_index < len(messages):
+        maybe_candidate = messages[message_index]
+        if isinstance(maybe_candidate, dict) and maybe_candidate.get("role") == "assistant":
+            candidate = maybe_candidate
+    if normalized_message_ref:
+        matches = [
+            (idx, message)
+            for idx, message in enumerate(messages)
+            if isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and _assistant_anchor_scene_message_ref(message) == normalized_message_ref
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None, None
+        if candidate is None:
+            return None, None
+    if candidate is not None:
+        # Content can be normalized or split during settlement; use the explicit
+        # index as the durability fallback only after a unique ref did not pick a
+        # different assistant message. The index is the full transcript index.
+        if normalized_message_ref and not _anchor_scene_candidate_matches_scene(candidate, scene):
+            return None, None
+        return message_index, candidate
+    for idx in range(len(messages) - 1, -1, -1):
+        message = messages[idx]
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return idx, message
+    return None, None
+
+
+def _normalize_anchor_scene_message_ref(message_ref) -> str:
+    ref = str(message_ref or "").strip()
+    if not ref:
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F]{64}", ref):
+        return ref.lower()
+    try:
+        payload = json.loads(ref)
+    except (TypeError, ValueError):
+        return ref
+    if not isinstance(payload, dict):
+        return ref
+    canonical = {
+        "role": str(payload.get("role") or ""),
+        "content": " ".join(str(payload.get("content") or "").split()),
+        "timestamp": payload.get("timestamp") or "",
+    }
+    return _anchor_scene_message_ref_digest(canonical)
+
+
+def _anchor_scene_records(session) -> dict:
+    records = getattr(session, "anchor_activity_scenes", None)
+    return records if isinstance(records, dict) else {}
+
+
+def _anchor_scene_message_text(message) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or part.get("input_text") or ""))
+            else:
+                parts.append(str(part or ""))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def _anchor_scene_message_reasoning_text(message) -> str:
+    if not isinstance(message, dict):
+        return ""
+    for key in ("reasoning", "_reasoning", "reasoning_content", "thinking"):
+        value = message.get(key)
+        if not value:
+            continue
+        if isinstance(value, list):
+            parts = []
+            for part in value:
+                if isinstance(part, dict):
+                    parts.append(
+                        str(
+                            part.get("text")
+                            or part.get("content")
+                            or part.get("reasoning")
+                            or part.get("summary")
+                            or ""
+                        )
+                    )
+                else:
+                    parts.append(str(part or ""))
+            return "\n".join(parts)
+        if isinstance(value, dict):
+            return str(
+                value.get("text")
+                or value.get("content")
+                or value.get("reasoning")
+                or value.get("summary")
+                or ""
+            )
+        return str(value or "")
+    return ""
+
+
+def _anchor_scene_clean_text(value) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _anchor_scene_text_key(value) -> str:
+    return _anchor_scene_clean_text(value).lower()
+
+
+def _anchor_scene_row_looks_like_final_answer(row_text_key: str, final_key: str) -> bool:
+    if not row_text_key or not final_key:
+        return False
+    if row_text_key == final_key:
+        return True
+    # #4587: align with the renderer's _anchorSceneProseMatchesFinalAnswer — a
+    # prefix-like overlap only counts as "the final answer" when it's a
+    # NEAR-complete match (ratio >= 0.9). A shorter intermediate-prose row that
+    # is merely a prefix of the final answer is legitimate progress narration and
+    # must be preserved in the persisted scene, not filtered out.
+    if not (final_key.startswith(row_text_key) or row_text_key.startswith(final_key)):
+        return False
+    shorter = min(len(row_text_key), len(final_key))
+    longer = max(len(row_text_key), len(final_key))
+    return shorter >= 80 and longer > 0 and (shorter / longer) >= 0.9
+
+
+def _anchor_scene_text_has_long_overlap(text_key: str, final_key: str) -> bool:
+    if len(text_key) < 80 or len(final_key) < 80:
+        return False
+    shorter, longer = (text_key, final_key) if len(text_key) <= len(final_key) else (final_key, text_key)
+    window = 64
+    scan_limit = min(len(shorter), 1400)
+    if scan_limit < window:
+        return False
+    for start in range(0, scan_limit - window + 1, 24):
+        chunk = shorter[start : start + window].strip()
+        if len(chunk) >= 48 and chunk in longer:
+            return True
+    text_tokens = set(re.findall(r"[a-z0-9_./:-]{3,}", text_key))
+    final_tokens = set(re.findall(r"[a-z0-9_./:-]{3,}", final_key))
+    if text_tokens and final_tokens:
+        common = text_tokens & final_tokens
+        shorter_count = min(len(text_tokens), len(final_tokens))
+        if shorter_count >= 3 and len(common) >= min(5, shorter_count) and (len(common) / shorter_count) >= 0.5:
+            return True
+    text_compact = re.sub(r"[\s`*_#|\[\](){}<>.,;:!?，。；：！？、/\\-]+", "", text_key)
+    final_compact = re.sub(r"[\s`*_#|\[\](){}<>.,;:!?，。；：！？、/\\-]+", "", final_key)
+    if len(text_compact) >= 40 and len(final_compact) >= 40:
+        text_grams = {text_compact[idx : idx + 4] for idx in range(0, len(text_compact) - 3)}
+        final_grams = {final_compact[idx : idx + 4] for idx in range(0, len(final_compact) - 3)}
+        common_grams = text_grams & final_grams
+        shorter_grams = min(len(text_grams), len(final_grams))
+        if shorter_grams and len(common_grams) >= 12 and (len(common_grams) / shorter_grams) >= 0.35:
+            return True
+    return False
+
+
+def _anchor_scene_row_is_stale_token_answer(row, row_text_key: str, final_key: str) -> bool:
+    if not isinstance(row, dict) or row.get("role") not in ("prose", "thinking"):
+        return False
+    source_type = str(row.get("source_event_type") or row.get("source") or "")
+    if source_type != "token":
+        return False
+    return _anchor_scene_text_has_long_overlap(row_text_key, final_key)
+
+
+def _anchor_scene_message_turn_duration(message):
+    if not isinstance(message, dict):
+        return None
+    for key in ("_turnDuration", "_turn_duration", "turn_duration"):
+        value = message.get(key)
+        if isinstance(value, (int, float)) and value >= 0:
+            return value
+    return None
+
+
+def _anchor_scene_tool_id(tool) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    return str(
+        tool.get("tid")
+        or tool.get("id")
+        or tool.get("tool_call_id")
+        or tool.get("tool_use_id")
+        or tool.get("call_id")
+        or ""
+    ).strip()
+
+
+def _anchor_scene_tool_name(tool) -> str:
+    if not isinstance(tool, dict):
+        return "tool"
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    return str(tool.get("name") or tool.get("tool_name") or fn.get("name") or "tool").strip() or "tool"
+
+
+def _anchor_scene_tool_args(tool):
+    if not isinstance(tool, dict):
+        return {}
+    for key in ("args", "input"):
+        value = tool.get(key)
+        if isinstance(value, dict):
+            return copy.deepcopy(value)
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    raw = fn.get("arguments")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _anchor_scene_row_base(role, kind, source_event_type, order_index, message_index, stream_id=""):
+    return {
+        "row_id": f"hydrated:{stream_id or 'stream'}:{role}:{message_index}:{order_index}",
+        "order_index": order_index,
+        "kind": kind,
+        "role": role,
+        "display_hint": {
+            "prose": "main_prose",
+            "thinking": "collapsed_thinking",
+            "tool": "tool_row",
+            "terminal": "terminal_status_row",
+        }.get(role, "activity_row"),
+        "display_hints": {
+            "compact_worklog": {
+                "prose": "main_prose",
+                "thinking": "collapsed_thinking",
+                "tool": "tool_row",
+                "terminal": "terminal_status_row",
+            }.get(role, "activity_row"),
+            "transparent_stream": "chronological_activity",
+        },
+        "source_event_type": source_event_type,
+        "event_id": None,
+        "local_id": None,
+        "run_id": None,
+        "stream_id": stream_id or None,
+        "seq": order_index,
+        "status": "completed",
+        "created_at": None,
+        "identity": {"event_id": None, "local_id": None, "run_id": None, "stream_id": stream_id or None, "seq": order_index},
+        "group": {
+            "group_key": f"assistant:{message_index}" if isinstance(message_index, int) else f"activity:{order_index}",
+            "activity_burst_id": None,
+            "activity_segment_seq": None,
+            "assistant_msg_idx": message_index if isinstance(message_index, int) else None,
+        },
+        "text": "",
+        "thinking": None,
+        "tool_call_id": None,
+        "tool": None,
+        "payload": {"assistant_msg_idx": message_index if isinstance(message_index, int) else None},
+    }
+
+
+def _anchor_scene_prose_row(text, order_index, message_index, stream_id=""):
+    row = _anchor_scene_row_base("prose", "process_prose", "settled_message", order_index, message_index, stream_id)
+    row["text"] = str(text or "")
+    row["payload"]["text"] = row["text"]
+    return row
+
+
+def _anchor_scene_thinking_row(text, order_index, message_index, stream_id=""):
+    row = _anchor_scene_row_base("thinking", "reasoning", "reasoning", order_index, message_index, stream_id)
+    row["text"] = str(text or "")
+    preview = _anchor_scene_clean_text(text)
+    row["thinking"] = {
+        "text": row["text"],
+        "preview": (preview[:177] + "...") if len(preview) > 180 else preview,
+        "dedupe_key": f"thinking:{preview.lower()}" if preview else "",
+    }
+    row["payload"]["text"] = row["text"]
+    return row
+
+
+def _anchor_scene_tool_row(tool, order_index, message_index, stream_id=""):
+    row = _anchor_scene_row_base("tool", "tool_completed", "tool_complete", order_index, message_index, stream_id)
+    tid = _anchor_scene_tool_id(tool)
+    name = _anchor_scene_tool_name(tool)
+    args = _anchor_scene_tool_args(tool)
+    preview = str((tool or {}).get("preview") or (tool or {}).get("summary") or "")
+    snippet = str((tool or {}).get("snippet") or (tool or {}).get("result") or (tool or {}).get("output") or "")
+    row["row_id"] = f"hydrated:{stream_id or 'stream'}:tool:{tid}" if tid else row["row_id"]
+    row["tool_call_id"] = tid or None
+    row["tool"] = {
+        "id": tid or None,
+        "name": name,
+        "args": args,
+        "preview": preview,
+        "snippet": snippet,
+        "result": copy.deepcopy((tool or {}).get("result")) if isinstance(tool, dict) else None,
+        "output": copy.deepcopy((tool or {}).get("output")) if isinstance(tool, dict) else None,
+        "done": True,
+        "is_error": bool((tool or {}).get("is_error") or (tool or {}).get("error")),
+        "duration": (tool or {}).get("duration") if isinstance(tool, dict) else None,
+        "started_at": (tool or {}).get("started_at") if isinstance(tool, dict) else None,
+        "signature": f"{name}|{tid}|{json.dumps(args, sort_keys=True, default=str)}",
+    }
+    row["payload"].update({"tid": tid, "id": tid, "name": name, "args": args, "preview": preview, "snippet": snippet})
+    return row
+
+
+def _anchor_scene_row_key(row) -> str:
+    if not isinstance(row, dict):
+        return ""
+    if row.get("role") == "tool":
+        tool = row.get("tool") if isinstance(row.get("tool"), dict) else {}
+        return "tool:" + str(
+            row.get("tool_call_id")
+            or tool.get("id")
+            or tool.get("tid")
+            or tool.get("tool_call_id")
+            or tool.get("tool_use_id")
+            or tool.get("call_id")
+            or row.get("row_id")
+            or ""
+        )
+    if row.get("role") in ("prose", "thinking"):
+        return f"{row.get('role')}:{_anchor_scene_text_key(row.get('text'))}"
+    if row.get("role") == "lifecycle":
+        source_type = str(row.get("source_event_type") or row.get("source") or "")
+        if source_type in ("compressing", "compressed"):
+            return "lifecycle:compression"
+    return f"{row.get('role') or row.get('kind')}:{row.get('source_event_type') or ''}:{row.get('status') or ''}:{row.get('row_id') or ''}"
+
+
+def _anchor_scene_row_has_live_identity(row) -> bool:
+    if not isinstance(row, dict):
+        return False
+    values = [row.get("row_id"), row.get("local_id"), row.get("event_id")]
+    identity = row.get("identity") if isinstance(row.get("identity"), dict) else {}
+    values.extend([identity.get("local_id"), identity.get("event_id")])
+    return any(str(value or "").startswith("live-") for value in values)
+
+
+def _anchor_scene_settle_live_running_row(row, *, has_settled_thinking: bool):
+    if not isinstance(row, dict):
+        return row
+    role = row.get("role")
+    if role not in ("thinking", "prose", "tool"):
+        return row
+    if str(row.get("status") or "").lower() != "running":
+        return row
+    if not _anchor_scene_row_has_live_identity(row):
+        return row
+    if role == "thinking" and has_settled_thinking:
+        return None
+    next_row = copy.deepcopy(row)
+    next_row["status"] = "completed"
+    return next_row
+
+
+def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_offset=0, tool_calls=None, stream_id=""):
+    if not isinstance(messages, list) or not isinstance(scene, dict) or not isinstance(message_index, int):
+        return scene
+    local_final_idx = message_index - int(message_offset or 0)
+    if local_final_idx < 0 or local_final_idx >= len(messages):
+        return scene
+    final_message = messages[local_final_idx]
+    if not isinstance(final_message, dict) or final_message.get("role") != "assistant":
+        return scene
+    turn_start = -1
+    for idx in range(local_final_idx - 1, -1, -1):
+        message = messages[idx]
+        if isinstance(message, dict) and message.get("role") == "user":
+            turn_start = idx
+            break
+    final_answer = _anchor_scene_message_text(final_message)
+    final_key = _anchor_scene_text_key(final_answer)
+    rows = []
+    seen = {}
+
+    def push(row):
+        if not isinstance(row, dict):
+            return
+        row = _anchor_scene_settle_live_running_row(
+            row,
+            has_settled_thinking=any(existing.get("role") == "thinking" for existing in rows),
+        )
+        if row is None or not isinstance(row, dict):
+            return
+        text_key = _anchor_scene_text_key(row.get("text"))
+        if row.get("role") in ("prose", "thinking") and _anchor_scene_row_looks_like_final_answer(text_key, final_key):
+            return
+        if _anchor_scene_row_is_stale_token_answer(row, text_key, final_key):
+            return
+        key = _anchor_scene_row_key(row)
+        if key and key in seen:
+            if key == "lifecycle:compression":
+                index = seen[key]
+                next_row = copy.deepcopy(row)
+                next_row["order_index"] = index
+                next_row["seq"] = index
+                rows[index] = next_row
+            return
+        if key:
+            seen[key] = len(rows)
+        next_row = copy.deepcopy(row)
+        next_row["order_index"] = len(rows)
+        next_row["seq"] = len(rows)
+        rows.append(next_row)
+
+    order = 0
+    for local_idx in range(turn_start + 1, local_final_idx):
+        message = messages[local_idx]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        absolute_idx = int(message_offset or 0) + local_idx
+        text = _anchor_scene_message_text(message)
+        if _anchor_scene_clean_text(text):
+            push(_anchor_scene_prose_row(text, order, absolute_idx, stream_id))
+            order += 1
+        reasoning = _anchor_scene_message_reasoning_text(message)
+        if _anchor_scene_clean_text(reasoning) and _anchor_scene_text_key(reasoning) != _anchor_scene_text_key(text):
+            push(_anchor_scene_thinking_row(reasoning, order, absolute_idx, stream_id))
+            order += 1
+        for key in ("tool_calls", "_partial_tool_calls"):
+            calls = message.get(key)
+            if isinstance(calls, list):
+                for call in calls:
+                    push(_anchor_scene_tool_row(call, order, absolute_idx, stream_id))
+                    order += 1
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        try:
+            absolute_idx = int(call.get("assistant_msg_idx"))
+        except (TypeError, ValueError):
+            continue
+        local_idx = absolute_idx - int(message_offset or 0)
+        if not (turn_start < local_idx < local_final_idx):
+            continue
+        push(_anchor_scene_tool_row(call, order, absolute_idx, stream_id))
+        order += 1
+    for row in scene.get("activity_rows") or []:
+        if isinstance(row, dict) and row.get("role") != "terminal":
+            push(row)
+    for row in scene.get("activity_rows") or []:
+        if isinstance(row, dict) and row.get("role") == "terminal":
+            push(row)
+    repaired = copy.deepcopy(scene)
+    repaired["version"] = "activity_scene_v1"
+    repaired["mode"] = repaired.get("mode") or "compact_worklog"
+    repaired["final_answer"] = final_answer if _anchor_scene_clean_text(final_answer) else repaired.get("final_answer", "")
+    repaired["final_message_ref"] = _assistant_anchor_scene_message_ref(final_message)
+    if repaired.get("turn_duration") is None:
+        duration = _anchor_scene_message_turn_duration(final_message)
+        if duration is not None:
+            repaired["turn_duration"] = duration
+    repaired["activity_rows"] = rows
+    identity = repaired.get("identity") if isinstance(repaired.get("identity"), dict) else {}
+    identity = dict(identity)
+    identity["source_message_refs"] = [
+        _assistant_anchor_scene_message_ref(message)
+        for message in messages[turn_start + 1 : local_final_idx + 1]
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    repaired["identity"] = identity
+    return repaired
+
+
+def _hydrate_anchor_activity_scenes(messages, records, *, message_offset=0, tool_calls=None):
+    if not isinstance(messages, list) or not isinstance(records, dict) or not records:
+        return messages
+    by_ref = {}
+    by_index = {}
+    for key, record in records.items():
+        if not isinstance(record, dict):
+            continue
+        scene = record.get("scene")
+        if not isinstance(scene, dict):
+            continue
+        ref = str(record.get("message_ref") or key or "")
+        if ref:
+            by_ref[ref] = record
+        try:
+            idx = int(record.get("message_index"))
+        except (TypeError, ValueError):
+            idx = None
+        if idx is not None:
+            by_index[idx] = record
+    out = list(messages)
+    # Read-side ref-ambiguity guard (parity with the write-side
+    # _find_anchor_scene_message, which returns None when a ref matches >1
+    # message). If two assistant messages ever share a ref (byte-identical
+    # whitespace-normalized content + identical _ts), attaching the same scene
+    # to both would render duplicate worklog groups. Count ref occurrences and
+    # fall through to the index-based match (which is positional, unambiguous)
+    # for any ref that resolves to more than one assistant message.
+    _ref_counts: dict[str, int] = {}
+    for _m in messages:
+        if isinstance(_m, dict) and _m.get("role") == "assistant":
+            _r = _assistant_anchor_scene_message_ref(_m)
+            if _r:
+                _ref_counts[_r] = _ref_counts.get(_r, 0) + 1
+    for local_idx, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        absolute_idx = int(message_offset or 0) + local_idx
+        _msg_ref = _assistant_anchor_scene_message_ref(message)
+        record = by_ref.get(_msg_ref) if _ref_counts.get(_msg_ref, 0) <= 1 else None
+        if not record:
+            candidate = by_index.get(absolute_idx)
+            if candidate and _anchor_scene_candidate_matches_scene(message, candidate.get("scene") or {}):
+                record = candidate
+        if not record:
+            continue
+        scene = record.get("scene")
+        if not isinstance(scene, dict):
+            continue
+        next_message = dict(message)
+        stream_id = record.get("stream_id")
+        next_message["_anchor_activity_scene"] = _complete_hydrated_anchor_scene(
+            messages,
+            scene,
+            absolute_idx,
+            message_offset=message_offset,
+            tool_calls=tool_calls,
+            stream_id=str(stream_id or ""),
+        )
+        if stream_id:
+            next_message["_anchor_stream_id"] = str(stream_id)
+        out[local_idx] = next_message
+    return out
+
+
+def _handle_session_anchor_scene(handler, body):
+    try:
+        require(body, "session_id", "scene")
+    except ValueError as exc:
+        return bad(handler, str(exc))
+    sid = str(body.get("session_id") or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required", 400)
+    message_index = _anchor_scene_message_index_from_request(body)
+    message_ref = str(body.get("message_ref") or "")
+    try:
+        scene = _sanitize_anchor_activity_scene(body.get("scene"))
+    except ValueError as exc:
+        return bad(handler, str(exc), 400)
+    try:
+        s = _get_or_materialize_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except PermissionError:
+        return bad(handler, "Read-only imported sessions cannot persist anchor scenes", 403)
+    # Active-profile visibility guard (parity with GET /api/session, routes.py:~8922).
+    # _get_or_materialize_session loads by id with no profile scoping, so without
+    # this an authenticated request under profile A could persist anchor scenes
+    # onto a session owned by profile B (cross-profile write). Reject as 404 —
+    # same shape the read path uses — and leave anchor_activity_scenes untouched.
+    if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
+        return bad(handler, "Session not found", 404)
+    with _get_session_agent_lock(sid):
+        idx, message = _find_anchor_scene_message(
+            getattr(s, "messages", None) or [],
+            message_index=message_index,
+            message_ref=message_ref,
+            scene=scene,
+        )
+        if message is None or idx is None:
+            return bad(handler, "Assistant message not found", 404)
+        if scene.get("turn_duration") is None:
+            duration = _anchor_scene_message_turn_duration(message)
+            if duration is not None:
+                scene["turn_duration"] = duration
+        ref = _assistant_anchor_scene_message_ref(message)
+        records = dict(_anchor_scene_records(s))
+        records[ref or f"index:{idx}"] = {
+            "version": "anchor_activity_scene_record_v1",
+            "message_index": idx,
+            "message_ref": ref,
+            "stream_id": str(body.get("stream_id") or ""),
+            "scene": scene,
+            "updated_at": time.time(),
+        }
+        if len(records) > 256:
+            ordered = sorted(
+                records.items(),
+                key=lambda item: float((item[1] or {}).get("updated_at") or 0),
+            )
+            records = dict(ordered[-256:])
+        s.anchor_activity_scenes = records
+        s.save(touch_updated_at=False, skip_index=True)
+    return j(handler, {"ok": True, "message_index": idx, "message_ref": ref})
 
 
 def _get_or_materialize_session(sid: str):
@@ -2396,7 +3913,7 @@ def _get_or_materialize_session(sid: str):
 
     # Preserve source metadata fields
     def _apply_source_meta(s):
-        s.is_cli_session = True
+        s.is_cli_session = is_cli_session_row(cli_meta)
         s.source_tag = cli_meta.get("source_tag")
         s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
         s.session_source = cli_meta.get("session_source")
@@ -2966,6 +4483,7 @@ def _catalog_has_provider(
         provider_raw in raw_provider_ids
         or (provider_normalized and provider_normalized in raw_provider_ids)
         or (provider_normalized and provider_normalized in normalized_provider_ids)
+
     )
 
 
@@ -3216,11 +4734,60 @@ def _custom_provider_api_key_for_context(entry: dict, provider: str) -> str:
         return ""
 
 
+def _context_length_config_api_key_for_provider(
+    provider: str | None,
+    cfg: dict | None,
+) -> str:
+    """Return a config/env API key usable for context-window metadata lookup."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    provider = _canonical_context_provider(provider)
+
+    def _resolve_key(raw_api_key, raw_key_env=None) -> str:
+        api_key_text = str(raw_api_key or "").strip()
+        if (
+            api_key_text.startswith("${")
+            and api_key_text.endswith("}")
+            and len(api_key_text) > 3
+        ):
+            resolved = os.getenv(api_key_text[2:-1], "").strip()
+            if resolved:
+                return resolved
+        elif api_key_text:
+            return api_key_text
+        key_env = str(raw_key_env or "").strip()
+        if key_env:
+            resolved = os.getenv(key_env, "").strip()
+            if resolved:
+                return resolved
+        return ""
+
+    providers_cfg = cfg.get("providers", {})
+    if isinstance(providers_cfg, dict):
+        for provider_key, provider_cfg in providers_cfg.items():
+            if not isinstance(provider_cfg, dict):
+                continue
+            if not _providers_match_for_context(provider_key, provider):
+                continue
+            api_key = _resolve_key(provider_cfg.get("api_key"), provider_cfg.get("key_env"))
+            if api_key:
+                return api_key
+
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, dict):
+        model_provider = _canonical_context_provider(model_cfg.get("provider"))
+        if not provider or _providers_match_for_context(model_provider, provider):
+            api_key = _resolve_key(model_cfg.get("api_key"), model_cfg.get("key_env"))
+            if api_key:
+                return api_key
+    return ""
+
+
 def _context_length_lookup_inputs_for_model(
     model: str | None,
     provider: str | None = None,
     *,
     base_url: str | None = None,
+    api_key: str | None = None,
     cfg: dict | None = None,
 ) -> _ContextLengthLookupInputs:
     """Return the effective metadata resolver inputs for a WebUI model.
@@ -3275,7 +4842,7 @@ def _context_length_lookup_inputs_for_model(
             break
 
     custom_context_length = None
-    effective_api_key = ""
+    effective_api_key = str(api_key or "").strip()
     if custom_providers:
         target_base = effective_base_url.rstrip("/")
         model_candidates = set(_model_lookup_candidates(bare_model or model_for_lookup))
@@ -3305,7 +4872,8 @@ def _context_length_lookup_inputs_for_model(
                 effective_provider = entry_slug
             if not effective_base_url and entry_base:
                 effective_base_url = entry_base
-            effective_api_key = _custom_provider_api_key_for_context(entry, effective_provider or entry_slug)
+            if not effective_api_key:
+                effective_api_key = _custom_provider_api_key_for_context(entry, effective_provider or entry_slug)
             custom_context_length = _models_config_context_length(models_cfg, bare_model or model_for_lookup)
             break
 
@@ -3322,6 +4890,9 @@ def _context_length_lookup_inputs_for_model(
             )
         ):
             global_context_length = _positive_context_length(raw_cfg_ctx)
+
+    if not effective_api_key:
+        effective_api_key = _context_length_config_api_key_for_provider(effective_provider, cfg)
 
     return _ContextLengthLookupInputs(
         config_context_length=provider_context_length or custom_context_length or global_context_length,
@@ -3430,6 +5001,15 @@ def _resolve_compatible_session_model_state(
     """
     model = str(model_id or "").strip()
     requested_provider = _clean_session_model_provider(model_provider)
+    if model and requested_provider and model.startswith(f"@{requested_provider}:"):
+        try:
+            from api.config import cfg as _active_cfg
+
+            providers_cfg = _active_cfg.get("providers") if isinstance(_active_cfg, dict) else {}
+        except Exception:
+            providers_cfg = {}
+        if isinstance(providers_cfg, dict) and requested_provider in providers_cfg:
+            return model, requested_provider, False
     if model and requested_provider:
         # Only safe when the model itself does not carry an ``@provider:model``
         # qualifier — qualified strings require the catalog to decide whether
@@ -3819,6 +5399,9 @@ def _resolve_effective_session_model_provider_for_display(session) -> str | None
 def _resolve_context_length_for_session_model(
     model: str | None,
     provider: str | None = None,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> int:
     """Best-effort current context window for a session model.
 
@@ -3837,6 +5420,8 @@ def _resolve_context_length_for_session_model(
         _ctx_lookup = _context_length_lookup_inputs_for_model(
             model_for_lookup,
             provider,
+            base_url=base_url,
+            api_key=api_key,
             cfg=_cfg_for_cl if isinstance(_cfg_for_cl, dict) else {},
         )
         try:
@@ -3853,6 +5438,119 @@ def _resolve_context_length_for_session_model(
             return _get_cl(model_for_lookup, _ctx_lookup.base_url) or 0
     except Exception:
         return 0
+
+
+def _session_context_length_lookup_state(
+    model: str | None,
+    provider: str | None,
+) -> tuple[str, str, str, str]:
+    """Return model/provider/base_url/api_key inputs for session context lookup.
+
+    This stays config-based and side-effect-free for GET /api/session. It avoids
+    a live provider catalog rebuild while still aligning the reload path with
+    the base URL / custom-provider key shape used by streaming saves. (#4248)
+    """
+    model_for_lookup = str(model or "").strip()
+    provider_for_lookup = str(provider or "").strip()
+    base_url_for_lookup = ""
+    api_key_for_lookup = ""
+    if not model_for_lookup:
+        return "", provider_for_lookup, "", ""
+    try:
+        from api.config import resolve_model_provider
+
+        model_for_resolution = model_with_provider_context(model_for_lookup, provider_for_lookup or None)
+        resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(model_for_resolution)
+        model_for_lookup = str(resolved_model or model_for_lookup).strip()
+        provider_for_lookup = str(resolved_provider or provider_for_lookup or "").strip()
+        base_url_for_lookup = str(resolved_base_url or "").strip()
+    except Exception:
+        logger.debug("session context-length lookup state resolution failed", exc_info=True)
+    if provider_for_lookup.startswith("custom:"):
+        try:
+            from api.config import resolve_custom_provider_connection
+
+            custom_key, custom_base = resolve_custom_provider_connection(provider_for_lookup)
+            api_key_for_lookup = str(custom_key or "").strip()
+            if not base_url_for_lookup:
+                base_url_for_lookup = str(custom_base or "").strip()
+        except Exception:
+            logger.debug("custom provider context-length connection resolution failed", exc_info=True)
+    return model_for_lookup, provider_for_lookup, base_url_for_lookup, api_key_for_lookup
+
+
+def _session_model_identity_matches(
+    stored_model: str | None,
+    stored_provider: str | None,
+    resolved_model: str | None,
+    resolved_provider: str | None,
+) -> bool:
+    stored = str(stored_model or "").strip()
+    resolved = str(resolved_model or "").strip()
+    if not stored or not resolved:
+        return False
+
+    def _split_model_identity(value: str) -> tuple[str, str | None]:
+        # Handle BOTH provider-qualified shapes so a slash-prefixed session model
+        # (e.g. ``deepseek/deepseek-v4-1m``, OpenRouter-style) compares equal to its
+        # resolved bare id. ``_split_provider_qualified_model`` only handles the
+        # ``@provider:model`` form; without the slash case a reload of a
+        # slash-stored model is wrongly treated as a model change, bypassing the
+        # #4248 256k-clobber guard (Codex regression gate, v0.51.x).
+        bare, prov = _split_provider_qualified_model(value)
+        if prov is None and "/" in value:
+            prefix, rest = value.split("/", 1)
+            prefix = prefix.strip()
+            rest = rest.strip()
+            if prefix and rest:
+                return rest, prefix
+        return bare, prov
+
+    stored_bare, stored_explicit_provider = _split_model_identity(stored)
+    resolved_bare, resolved_explicit_provider = _split_model_identity(resolved)
+    stored_provider_norm = _canonical_context_provider(stored_explicit_provider or stored_provider)
+    resolved_provider_norm = _canonical_context_provider(resolved_explicit_provider or resolved_provider)
+    if stored == resolved and stored_provider_norm == resolved_provider_norm:
+        return True
+    if stored_bare != resolved_bare:
+        return False
+    if stored_provider_norm and resolved_provider_norm:
+        return stored_provider_norm == resolved_provider_norm
+    return True
+
+
+def _should_accept_session_context_length_refresh(
+    persisted: int,
+    resolved: int,
+    *,
+    model_changed: bool = False,
+) -> bool:
+    if not resolved:
+        return False
+    if not persisted:
+        return True
+    # #4248: an anonymous reload resolver can still fall through to the agent
+    # metadata default fallback. Do not let that lower-confidence 256k value
+    # clobber a larger context window persisted by the streaming path. If the
+    # effective model changed, though, a 256k result may be the real new model
+    # window and should replace the old snapshot.
+    return model_changed or not (resolved == 256_000 and persisted > resolved)
+
+
+def _rescale_threshold_tokens_for_context_window(
+    threshold: int,
+    old_window: int,
+    new_window: int,
+) -> int:
+    try:
+        threshold = int(threshold or 0)
+        old_window = int(old_window or 0)
+        new_window = int(new_window or 0)
+    except (TypeError, ValueError):
+        return 0
+    if threshold <= 0 or old_window <= 0 or new_window <= 0:
+        return 0
+    return max(1, int(threshold * new_window / old_window))
 
 
 def _session_model_state_from_request(
@@ -3933,6 +5631,10 @@ def _resolve_cli_import_metadata(session_id: str, *, requested_profile=None, all
 
 
 def _messaging_session_identity(session: dict, raw_source: str) -> str:
+    sid = _safe_first(session.get("session_id"))
+    if sid and _is_pre_compression_continuation_row(session):
+        return f"{raw_source}|session_id:{sid}"
+
     metadata = _lookup_gateway_session_identity(session.get("session_id"))
     session_key = _safe_first(
         metadata.get("session_key"),
@@ -3967,7 +5669,27 @@ def _messaging_session_identity(session: dict, raw_source: str) -> str:
 
     if identity_parts:
         return f"{raw_source}|" + "|".join(identity_parts)
+
     return raw_source
+
+
+def _is_pre_compression_snapshot_id(session_id: str) -> bool:
+    sid = _safe_first(session_id)
+    if not sid or not all(c in "0123456789abcdefghijklmnopqrstuvwxyz_" for c in sid):
+        return False
+    try:
+        path = SESSION_DIR / f"{sid}.json"
+        if not path.exists():
+            return False
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return bool(data.get("pre_compression_snapshot"))
+    except Exception:
+        return False
+
+
+def _is_pre_compression_continuation_row(session: dict) -> bool:
+    parent_sid = _safe_first(session.get("parent_session_id"))
+    return bool(parent_sid and _is_pre_compression_snapshot_id(parent_sid))
 
 
 def _session_messaging_raw_source(session: dict) -> str:
@@ -4031,9 +5753,14 @@ def _should_hide_stale_messaging_session(
         return True
 
     if not _has_durable_messaging_identity(session):
+        if _is_pre_compression_continuation_row(session):
+            return False
+        parent_sid = _safe_first(session.get("parent_session_id"))
+        if parent_sid and parent_sid in active_gateway_session_ids:
+            return True
         return True
 
-    if session.get("parent_session_id"):
+    if session.get("parent_session_id") and not _is_pre_compression_continuation_row(session):
         return True
 
     message_count = _numeric_count(session.get("message_count"))
@@ -4414,8 +6141,11 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
     parent_messages = list(getattr(parent, "messages", []) or [])
     if not parent_messages:
         return primary_messages
+    if _messages_start_with_visible_prefix(primary_messages, parent_messages):
+        return primary_messages
     merged_messages = []
     seen_message_keys = set()
+    seen_messages_by_key = {}
     for msg in sorted(list(parent_messages) + list(primary_messages), key=lambda m: (
         float(m.get("timestamp") or 0),
         str(m.get("role") or ""),
@@ -4423,8 +6153,10 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
     )):
         key = _session_message_merge_key(msg)
         if key in seen_message_keys:
+            _merge_session_display_metadata(seen_messages_by_key.get(key), msg)
             continue
         seen_message_keys.add(key)
+        seen_messages_by_key[key] = msg
         merged_messages.append(msg)
     return merged_messages
 
@@ -4583,6 +6315,46 @@ def _normalize_sidebar_source_flags(session: dict) -> dict:
     return normalized
 
 
+def _reconcile_session_detail_source_flags(session: dict, state_meta: dict) -> dict:
+    """Return a /api/session payload whose source flags match state.db truth.
+
+    WebUI-origin sidecars can carry stale CLI/import flags after older repair or
+    import paths touched the JSON file. The sidebar projection already trusts the
+    state.db source row for those sessions; the detail endpoint must do the same
+    or the frontend opens a WebUI-native transcript as an external session and
+    starts the destructive active-refresh reload loop.
+    """
+    if not isinstance(session, dict):
+        return session
+    if not _session_source_is_webui(state_meta):
+        return dict(session)
+
+    reconciled = dict(session)
+    reconciled["is_cli_session"] = False
+    reconciled["read_only"] = False
+    reconciled["source_tag"] = _safe_first(state_meta.get("source_tag"), "webui")
+    reconciled["raw_source"] = _safe_first(state_meta.get("raw_source"), "webui")
+    reconciled["session_source"] = _safe_first(state_meta.get("session_source"), "webui")
+    reconciled["source_label"] = _safe_first(state_meta.get("source_label"), "WebUI")
+    if state_meta.get("source"):
+        reconciled["source"] = state_meta["source"]
+
+    for key in ("message_count", "actual_message_count"):
+        if state_meta.get(key) is not None:
+            reconciled[key] = max(
+                _numeric_count(reconciled.get(key)),
+                _numeric_count(state_meta.get(key)),
+            )
+    for key in ("created_at", "updated_at", "last_message_at"):
+        if state_meta.get(key) is not None:
+            current = reconciled.get(key)
+            try:
+                reconciled[key] = max(float(current or 0), float(state_meta.get(key) or 0))
+            except (TypeError, ValueError):
+                reconciled[key] = state_meta[key]
+    return reconciled
+
+
 def _session_source_is_webui(session: dict) -> bool:
     """Return True for state.db/sidebar rows that describe WebUI-origin sessions."""
     if not isinstance(session, dict):
@@ -4591,6 +6363,24 @@ def _session_source_is_webui(session: dict) -> bool:
         if str(session.get(key) or "").strip().lower() == "webui":
             return True
     return False
+
+
+def _normalized_source_marker(value) -> str:
+    marker = str(value or "").strip().lower()
+    if marker.endswith(" session"):
+        marker = marker[:-len(" session")].strip()
+    return marker.replace("-", "_").replace(" ", "_")
+
+
+def _is_api_server_sidecar_row(session: dict) -> bool:
+    """Return True for API-server imported sidecars that need orphan pruning."""
+    if not isinstance(session, dict) or _session_source_is_webui(session):
+        return False
+    markers = {
+        _normalized_source_marker(session.get(key))
+        for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
+    }
+    return bool(markers & {"api", "api_server"})
 
 
 def _session_lineage_ids(session: dict) -> set[str]:
@@ -4800,7 +6590,9 @@ from api.models import (
     get_state_db_session_messages,
     get_state_db_session_summary,
     merge_session_messages_append_only,
+    _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
+    _merge_session_display_metadata,
     _session_message_merge_key,
     _session_message_visible_key,
     _is_empty_partial_activity_message,
@@ -4811,17 +6603,121 @@ from api.models import (
     is_cron_session,
     is_safe_session_id,
 )
+
+
+def _pre_compression_continuation_session_id(session) -> str | None:
+    """Return the newest visible descendant for a hidden compression snapshot.
+
+    Mobile browsers can miss the final SSE `done` handoff while backgrounded.
+    On reload they may request the archived pre-compression session id from the
+    stale URL/localStorage. The old snapshot is intentionally hidden from the
+    sidebar, so expose a lightweight recovery hint when a child continuation
+    exists either in memory or on disk. Follow bounded snapshot-to-snapshot hops
+    so repeated compression still lands on the latest visible continuation.
+    """
+    if not getattr(session, "pre_compression_snapshot", False):
+        return None
+    sid = _safe_first(getattr(session, "session_id", None))
+    if not sid:
+        return None
+    # #2980 hardening: the resolved continuation is written to the client's
+    # URL/localStorage, so it must stay within the requested snapshot's own
+    # profile. Children are matched only by parent_session_id below; a
+    # crafted/corrupt foreign-profile sidecar whose parent_session_id collided
+    # with this snapshot's id would otherwise leak cross-profile. Pin the
+    # snapshot's profile and reject any child that isn't profile-matched.
+    snapshot_profile = getattr(session, "profile", None)
+
+    def _child_rows() -> list:
+        rows = []
+        seen_ids = set()
+        try:
+            with LOCK:
+                memory_sessions = list(SESSIONS.values())
+            for child in memory_sessions:
+                child_sid = _safe_first(getattr(child, "session_id", None))
+                if not child_sid or child_sid in seen_ids:
+                    continue
+                seen_ids.add(child_sid)
+                rows.append(child)
+        except Exception:
+            pass
+        try:
+            for path in SESSION_DIR.glob("*.json"):
+                if path.name.startswith("_"):
+                    continue
+                child_sid = path.stem
+                if not child_sid or child_sid in seen_ids:
+                    continue
+                child = Session.load_metadata_only(child_sid)
+                if child:
+                    seen_ids.add(child_sid)
+                    rows.append(child)
+        except Exception:
+            pass
+        return rows
+
+    children_by_parent: dict[str, list] = {}
+    for child in _child_rows():
+        parent_sid = _safe_first(getattr(child, "parent_session_id", None))
+        child_sid = _safe_first(getattr(child, "session_id", None))
+        if not parent_sid or not child_sid or child_sid == sid:
+            continue
+        # Cross-profile guard: only follow continuations within the snapshot's profile.
+        if not _profiles_match(getattr(child, "profile", None), snapshot_profile):
+            continue
+        children_by_parent.setdefault(parent_sid, []).append(child)
+
+    candidates = []
+    frontier = [sid]
+    seen = {sid}
+    for _ in range(20):
+        if not frontier:
+            break
+        parent_sid = frontier.pop(0)
+        for child in children_by_parent.get(parent_sid, []):
+            child_sid = _safe_first(getattr(child, "session_id", None))
+            if not child_sid or child_sid in seen:
+                continue
+            seen.add(child_sid)
+            if getattr(child, "pre_compression_snapshot", False):
+                frontier.append(child_sid)
+            else:
+                candidates.append(child)
+
+    if not candidates:
+        return None
+    latest = max(
+        candidates,
+        key=lambda child: float(
+            _safe_first(
+                getattr(child, "updated_at", None),
+                getattr(child, "created_at", None),
+                0,
+            ) or 0
+        ),
+    )
+    latest_sid = getattr(latest, "session_id", None) or None
+    # Only hand the client a well-formed session id (it gets written to URL/localStorage).
+    if latest_sid and not is_safe_session_id(latest_sid):
+        return None
+    return latest_sid
 from api.workspace import (
     load_workspaces,
     save_workspaces,
     get_last_workspace,
     set_last_workspace,
     git_info_for_workspace,
+    authorize_escape_target,
+    EscapeAuthorizationExpiredError,
     list_dir,
+    list_authorized_escape_dir,
     dir_signature,
     list_workspace_suggestions,
     read_file_content,
+    read_authorized_escape_file_content,
     safe_resolve_ws,
+    raw_authorized_escape_target,
     resolve_trusted_workspace,
     open_anchored_fd,
     open_anchored_create_fd,
@@ -4832,6 +6728,8 @@ from api.workspace import (
     make_anchored_dir,
     validate_workspace_to_add,
     _is_blocked_system_path,
+    _home_path,
+    _is_within,
     _strip_surrounding_quotes,
     _is_remote_terminal_backend,
     _workspace_blocked_roots,
@@ -4850,6 +6748,8 @@ from api.streaming import (
     cancel_stream,
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
+    _compact_for_echo_compare,
+    _strip_compact_echo_suffix,
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
 from api.run_journal import (
@@ -4941,6 +6841,91 @@ def _session_attention_summary(session_id: str) -> dict | None:
             "severity": "question",
         }
     return None
+
+
+_SIDEBAR_SESSION_RESPONSE_FIELDS = {
+    "session_id",
+    "title",
+    "display_title",
+    "_state_db_title",
+    "workspace",
+    "model",
+    "model_provider",
+    "message_count",
+    "user_message_count",
+    "created_at",
+    "updated_at",
+    "last_message_at",
+    "pinned",
+    "archived",
+    "project_id",
+    "profile",
+    "input_tokens",
+    "output_tokens",
+    "estimated_cost",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cache_hit_percent",
+    "personality",
+    "context_length",
+    "config_context_length",
+    "window_usage_percent",
+    "source_tag",
+    "raw_source",
+    "session_source",
+    "source_label",
+    "is_cli_session",
+    "is_messaging_session",
+    "is_streaming",
+    "active_stream_id",
+    "has_pending_user_message",
+    "pending_started_at",
+    "default_hidden",
+    "worktree_path",
+    "worktree_branch",
+    "parent_session_id",
+    "parent_title",
+    "parent_source",
+    "relationship_type",
+    "pre_compression_snapshot",
+    "_lineage_root_id",
+    "_lineage_tip_id",
+    "_compression_segment_count",
+    "_lineage_collapsed_count",
+    "_parent_lineage_root_id",
+    "_cross_surface_child_session",
+    "match_type",
+    "match_preview",
+    # Preserved so the sidebar can suppress rename / action-menu / swipe on
+    # read-only (imported CLI + Claude Code) sessions, and render the detailed
+    # gateway model label. Dropping these silently regressed both surfaces.
+    # Only the latest `gateway_routing` is included (the sidebar label reader
+    # prefers it); the unbounded `gateway_routing_history` is intentionally NOT
+    # sent in the list payload to avoid per-row bloat.
+    "read_only",
+    "is_read_only",
+    "gateway_routing",
+}
+
+
+def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None = None) -> dict:
+    """Return the bounded /api/sessions row shape used by the sidebar.
+
+    Full session/detail fields such as messages, tool calls, compression
+    summaries, context-engine state, gateway routing history, drafts, and
+    pending user text are intentionally excluded from the list endpoint. Large
+    installs should not ship tens of KB of per-row detail just to render a
+    conversation title.
+    """
+    item = {
+        key: value
+        for key, value in dict(session).items()
+        if key in _SIDEBAR_SESSION_RESPONSE_FIELDS
+    }
+    if isinstance(item.get("title"), str):
+        item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
+    item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
+    return item
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -5066,6 +7051,15 @@ _LOGIN_LOCALE = {
         "btn": "Zaloguj si\u0119",
         "invalid_pw": "Nieprawid\u0142owe has\u0142o",
         "conn_failed": "Po\u0142\u0105czenie nie powiod\u0142o si\u0119",
+    },
+    "vi": {
+        "lang": "vi",
+        "title": "\u0110\u0103ng nh\u1eadp",
+        "subtitle": "Nh\u1eadp m\u1eadt kh\u1ea9u c\u1ee7a b\u1ea1n \u0111\u1ec3 ti\u1ebfp t\u1ee5c",
+        "placeholder": "M\u1eadt kh\u1ea9u",
+        "btn": "\u0110\u0103ng nh\u1eadp",
+        "invalid_pw": "M\u1eadt kh\u1ea9u kh\u00f4ng h\u1ee3p l\u1ec7",
+        "conn_failed": "K\u1ebft n\u1ed1i th\u1ea5t b\u1ea1i",
     },
 }
 
@@ -5278,10 +7272,16 @@ def _llm_wiki_config_path() -> str | None:
 # Cap WIKI walks to prevent self-DoS if WIKI_PATH points at /, /etc, /home, etc.
 # Real LLM wikis have under a few thousand files; 10k is generous and catches misconfig.
 _LLM_WIKI_MAX_FILES = 10000
+# Cap a single served wiki page at 2 MiB so a huge/binary file can't be slurped
+# wholesale into memory + a JSON response (DoS / memory-blowup guard).
+_LLM_WIKI_MAX_PAGE_BYTES = 2 * 1024 * 1024
 # Refuse to walk these system roots even if explicitly configured.
 _LLM_WIKI_FORBIDDEN_ROOTS = frozenset(
     str(Path(p).expanduser().resolve()) for p in ("/", "/etc", "/usr", "/var", "/opt", "/sys", "/proc")
 )
+_WIKI_ALLOWLIST_TTL = 5.0  # seconds
+_wiki_allowlist_cache: dict[str, dict[str, object]] = {}
+_wiki_allowlist_cache_lock = threading.Lock()
 
 
 def _llm_wiki_resolve_path() -> tuple[Path, str, bool]:
@@ -5334,18 +7334,54 @@ def _llm_wiki_count_files(root: Path) -> int:
     return count
 
 
-def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
+def _llm_wiki_page_files_cache_signature(wiki_path: Path) -> tuple:
+    """Return a change-detection signature over the configured wiki sections.
+
+    Reads only the section-level directories (not every page), using
+    st_mtime_ns, st_dev, and st_ino so that quick section replacements and
+    mtime-ns-resolution changes are both caught.  Missing or inaccessible
+    section dirs are represented as ``(section, None)`` so their appearance
+    or disappearance also invalidates the cache.
+    """
+    sig = []
+    for section in _LLM_WIKI_PAGE_DIRS:
+        section_dir = wiki_path / section
+        try:
+            st = section_dir.lstat()
+        except OSError:
+            sig.append((section, None))
+            continue
+        sig.append((section, st.st_dev, st.st_ino, st.st_mtime_ns))
+    return tuple(sig)
+
+
+def _llm_wiki_page_files_uncached(wiki_path: Path) -> list[Path]:
     pages: list[Path] = []
-    # Defense in depth: refuse forbidden system roots.
+    # Defense in depth: refuse forbidden system roots, and resolve the wiki root
+    # ONCE as the single trust base for all containment checks below.
     try:
-        if str(wiki_path.resolve()) in _LLM_WIKI_FORBIDDEN_ROOTS:
+        wiki_real = wiki_path.resolve()
+        if str(wiki_real) in _LLM_WIKI_FORBIDDEN_ROOTS:
             return pages
     except Exception:
         return pages
+
+    def _is_clean_relpath(rel: Path) -> bool:
+        # No dot-prefixed segment (dotfile/dotdir) anywhere in the path.
+        return not any(part.startswith(".") for part in rel.parts)
+
     iterated = 0
     for dirname in _LLM_WIKI_PAGE_DIRS:
         section = wiki_path / dirname
         if not section.exists() or not section.is_dir():
+            continue
+        # The section itself must resolve UNDER the real wiki root — guards a
+        # symlinked section (e.g. concepts -> /tmp/outside) from exposing files
+        # outside the wiki tree entirely.
+        try:
+            section_real = section.resolve()
+            section_real.relative_to(wiki_real)
+        except (OSError, ValueError):
             continue
         for item in section.rglob("*.md"):
             iterated += 1
@@ -5353,14 +7389,165 @@ def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
                 return pages  # bounded
             try:
                 rel = item.relative_to(section)
-                if item.is_file() and not any(part.startswith(".") for part in rel.parts):
-                    pages.append(item)
-            except Exception:
+                if not item.is_file() or not _is_clean_relpath(rel):
+                    continue
+                # Reject multi-link (hardlinked) page files. A hardlink at a
+                # clean *.md name can point at an arbitrary inode (incl. one
+                # outside the wiki); O_NOFOLLOW + inode-identity at read time
+                # cannot tell such a hardlink apart from the real page, so
+                # exclude any file with st_nlink > 1 from the allowlist. (#4375)
+                try:
+                    if item.lstat().st_nlink > 1:
+                        continue
+                except OSError:
+                    continue
+                # Resolve the real target and require it to live under BOTH the
+                # real wiki root and the real section, with no dot-prefixed
+                # segment on the resolved-relative path. This closes symlink
+                # escapes whose link name looks like a clean *.md page but whose
+                # target is an arbitrary / hidden / out-of-tree file (the read
+                # endpoint would otherwise serve it).
+                item_real = item.resolve()
+                item_real.relative_to(section_real)
+                rel_real = item_real.relative_to(wiki_real)
+                if not _is_clean_relpath(rel_real):
+                    continue
+                pages.append(item)
+            except (OSError, ValueError):
                 continue
     return pages
 
 
-def _llm_wiki_last_writer(wiki_path: Path, page_files: list[Path]) -> str:
+def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
+    """Return all allowlisted wiki page paths under *wiki_path*.
+
+    Trust boundary: the allowlist uses ``(st_dev, st_ino)`` inode identity.
+    A hardlink created at a listed page name *before* this snapshot is taken
+    would carry that page's identity through to the caller's fstat check.
+    This is only exploitable with write access to the wiki directory, which
+    is outside the realistic threat model (the wiki directory is
+    operator-controlled).  Defense-in-depth via an ``openat``-chain with
+    no-follow directory fds would close the gap but is deferred — the inode
+    match already defeats path-swap and symlink races at open time.
+    """
+    try:
+        wiki_root = wiki_path.resolve()
+    except OSError:
+        wiki_root = wiki_path
+
+    key = str(wiki_root)
+    sig = _llm_wiki_page_files_cache_signature(wiki_root)
+    now = time.monotonic()
+
+    with _wiki_allowlist_cache_lock:
+        cached = _wiki_allowlist_cache.get(key)
+        if (
+            cached is not None
+            and cached.get("signature") == sig
+            and now < cached.get("expires_at", 0)
+        ):
+            return list(cached["files"])
+
+    pages = _llm_wiki_page_files_uncached(wiki_root)
+
+    with _wiki_allowlist_cache_lock:
+        _wiki_allowlist_cache[key] = {
+            "signature": sig,
+            "expires_at": now + _WIKI_ALLOWLIST_TTL,
+            "files": tuple(pages),
+        }
+    return list(pages)
+
+
+def _llm_wiki_clear_page_files_cache() -> None:
+    """Clear the allowlist cache; intended for tests only."""
+    with _wiki_allowlist_cache_lock:
+        _wiki_allowlist_cache.clear()
+
+
+def _llm_wiki_allowlisted_entries(wiki_path: Path) -> dict[str, tuple[Path, tuple[int, int]]]:
+    """Return listed relpaths mapped to resolved targets plus stable identity."""
+    try:
+        wiki_real = wiki_path.resolve()
+    except OSError:
+        return {}
+
+    def _wiki_read_relpath_is_clean(rel: Path) -> bool:
+        rel_text = rel.as_posix()
+        return bool(rel.parts) and "\\" not in rel_text and not any(part.startswith(".") for part in rel.parts)
+
+    entries: dict[str, tuple[Path, tuple[int, int]]] = {}
+    try:
+        for listed_path in _llm_wiki_page_files(wiki_real):
+            try:
+                rel_listed = listed_path.relative_to(wiki_real)
+                if not _wiki_read_relpath_is_clean(rel_listed):
+                    continue
+                section_real = (wiki_real / rel_listed.parts[0]).resolve()
+                section_real.relative_to(wiki_real)
+                resolved_target = listed_path.resolve()
+                resolved_target.relative_to(section_real)
+                if not resolved_target.is_file():
+                    continue
+                # Reject hardlinked targets (st_nlink > 1): a multi-link file at
+                # a clean page name can carry an arbitrary inode through the
+                # O_NOFOLLOW + identity read check. Defense in depth alongside
+                # the same rejection in the allowlist walk. (#4375)
+                if resolved_target.stat().st_nlink > 1:
+                    continue
+                rel_resolved = resolved_target.relative_to(wiki_real)
+                if not _wiki_read_relpath_is_clean(rel_resolved):
+                    continue
+                st0 = resolved_target.stat()
+                if listed_path.resolve() != resolved_target:
+                    continue
+                entries[rel_listed.as_posix()] = (resolved_target, (st0.st_dev, st0.st_ino))
+            except (OSError, ValueError):
+                continue
+    except Exception:
+        return {}
+    return entries
+
+
+def _llm_wiki_status_file_entry_stat(wiki_path: Path, path: Path) -> os.stat_result | None:
+    """Return the current top-level status-file entry metadata when it is safe to trust."""
+    try:
+        wiki_root = wiki_path.resolve()
+    except OSError:
+        wiki_root = wiki_path
+    try:
+        path.resolve().relative_to(wiki_root)
+        st_entry = path.lstat()
+    except (OSError, ValueError):
+        return None
+    if not _stat.S_ISREG(st_entry.st_mode):
+        return None
+    return st_entry
+
+
+def _llm_wiki_verified_status_file_stat(wiki_path: Path, path: Path) -> os.stat_result | None:
+    """Return identity-checked metadata for a top-level wiki status file."""
+    st_entry = _llm_wiki_status_file_entry_stat(wiki_path, path)
+    if st_entry is None:
+        return None
+    fd = None
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        st_open = os.fstat(fd)
+        if (st_open.st_dev, st_open.st_ino) != (st_entry.st_dev, st_entry.st_ino):
+            return None
+        return st_open
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _llm_wiki_last_writer(
+    wiki_path: Path,
+    page_files: list[Path] | list[tuple[Path, tuple[int, int]]],
+) -> str:
     """Best-effort last-writer detection for the LLM Wiki status card.
 
     Closes the gap left by the original panel (commit 2684d6fa, Issue #1257):
@@ -5395,52 +7582,78 @@ def _llm_wiki_last_writer(wiki_path: Path, page_files: list[Path]) -> str:
 
     # Priority 1: most recent page frontmatter (resolved-path must stay in-wiki)
     latest_page: Path | None = None
+    latest_identity: tuple[int, int] | None = None
     latest_mtime = -1.0
-    for candidate in page_files:
+    for item in page_files:
+        candidate, identity = item if isinstance(item, tuple) else (item, None)
         if not _within_wiki(candidate):
             continue  # skip symlinks resolving outside the wiki
         try:
-            mtime = candidate.stat().st_mtime
+            st_candidate = candidate.stat()
         except Exception:
             continue
+        if identity is not None and (st_candidate.st_dev, st_candidate.st_ino) != identity:
+            continue
+        mtime = st_candidate.st_mtime
         if mtime > latest_mtime:
             latest_mtime = mtime
             latest_page = candidate
+            latest_identity = identity
     if latest_page is not None:
         try:
-            with open(latest_page, encoding="utf-8", errors="replace") as fh:
-                first = fh.readline()
-                if first.strip() == "---":
-                    # Read only the frontmatter block, bounded to a small line cap.
-                    for _ in range(200):
-                        line = fh.readline()
-                        if line == "" or line.strip() == "---":
-                            break  # EOF or end of frontmatter — never touch the body
-                        stripped = line.strip()
-                        lower = stripped.lower()
-                        for key in ("updated_by", "writer", "author"):
-                            if lower.startswith(f"{key}:"):
-                                value = stripped.split(":", 1)[1].strip()
-                                if value:
-                                    return value
+            fd = os.open(str(latest_page), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                if latest_identity is not None:
+                    st_open = os.fstat(fd)
+                    if (st_open.st_dev, st_open.st_ino) != latest_identity:
+                        raise FileNotFoundError("wiki page changed after allowlist snapshot")
+                with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+                    fd = None
+                    first = fh.readline()
+                    if first.strip() == "---":
+                        # Read only the frontmatter block, bounded to a small line cap.
+                        for _ in range(200):
+                            line = fh.readline()
+                            if line == "" or line.strip() == "---":
+                                break  # EOF or end of frontmatter — never touch the body
+                            stripped = line.strip()
+                            lower = stripped.lower()
+                            for key in ("updated_by", "writer", "author"):
+                                if lower.startswith(f"{key}:"):
+                                    value = stripped.split(":", 1)[1].strip()
+                                    if value:
+                                        return value
+            finally:
+                if fd is not None:
+                    os.close(fd)
         except Exception:
             pass
 
     # Priority 2: log.md last entry action verb (heading lines only, bounded)
     log_path = wiki_path / "log.md"
-    if _within_wiki(log_path) and log_path.is_file():
+    log_entry = _llm_wiki_status_file_entry_stat(wiki_path, log_path)
+    if log_entry is not None:
         try:
-            with open(log_path, encoding="utf-8", errors="replace") as fh:
-                for _ in range(5000):  # cap the heading scan
-                    line = fh.readline()
-                    if line == "":
-                        break
-                    stripped = line.strip()
-                    if not stripped.startswith("## [") or "|" not in stripped:
-                        continue
-                    tail = stripped.split("]", 1)[1].strip() if "]" in stripped else ""
-                    action = tail.split()[0] if tail else "update"
-                    return f"ai-agent ({action})"
+            fd = os.open(str(log_path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                st_open = os.fstat(fd)
+                if (st_open.st_dev, st_open.st_ino) != (log_entry.st_dev, log_entry.st_ino):
+                    raise FileNotFoundError("wiki log changed before open")
+                with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+                    fd = None
+                    for _ in range(5000):  # cap the heading scan
+                        line = fh.readline()
+                        if line == "":
+                            break
+                        stripped = line.strip()
+                        if not stripped.startswith("## [") or "|" not in stripped:
+                            continue
+                        tail = stripped.split("]", 1)[1].strip() if "]" in stripped else ""
+                        action = tail.split()[0] if tail else "update"
+                        return f"ai-agent ({action})"
+            finally:
+                if fd is not None:
+                    os.close(fd)
         except Exception:
             pass
 
@@ -5473,15 +7686,27 @@ def _build_llm_wiki_status() -> dict:
             base["status"] = "not_directory"
             return base
 
-        page_files = _llm_wiki_page_files(wiki_path)
-        status_files = [p for p in (wiki_path / "SCHEMA.md", wiki_path / "index.md", wiki_path / "log.md") if p.exists() and p.is_file()]
-        status_files.extend(page_files)
-        latest = None
-        for item in status_files:
+        allowlisted_entries = _llm_wiki_allowlisted_entries(wiki_path)
+        verified_page_entries: list[tuple[Path, tuple[int, int], os.stat_result]] = []
+        for target, identity in allowlisted_entries.values():
             try:
-                mtime = item.stat().st_mtime
+                st = target.stat()
             except Exception:
                 continue
+            if (st.st_dev, st.st_ino) != identity:
+                continue
+            verified_page_entries.append((target, identity, st))
+        page_entries = [(target, identity) for target, identity, _ in verified_page_entries]
+        page_files = [target for target, _, _ in verified_page_entries]
+        status_files: list[tuple[Path, float]] = []
+        for path in (wiki_path / "SCHEMA.md", wiki_path / "index.md", wiki_path / "log.md"):
+            st_status = _llm_wiki_verified_status_file_stat(wiki_path, path)
+            if st_status is None:
+                continue
+            status_files.append((path, st_status.st_mtime))
+        status_files.extend((target, st.st_mtime) for target, _, st in verified_page_entries)
+        latest = None
+        for _, mtime in status_files:
             latest = mtime if latest is None else max(latest, mtime)
 
         base.update({
@@ -5489,10 +7714,10 @@ def _build_llm_wiki_status() -> dict:
             "enabled": True,
             "status": "ready" if page_files else "empty",
             "entry_count": len(page_files),
-            "page_count": len(page_files),
+            "page_count": len(page_entries),
             "raw_source_count": _llm_wiki_count_files(wiki_path / "raw"),
             "last_updated": _llm_wiki_safe_iso(latest),
-            "last_writer": _llm_wiki_last_writer(wiki_path, page_files),
+            "last_writer": _llm_wiki_last_writer(wiki_path, page_entries),
         })
         return base
     except Exception as exc:
@@ -6313,6 +8538,31 @@ def _clean_plugin_visibility_text(value, *, limit=240) -> str:
     return text
 
 
+def _plugin_visibility_category_from_key(key: str) -> str:
+    """Return the config category prefix for nested plugin keys."""
+    raw = str(key or "").strip().replace("\\", "/")
+    if "/" not in raw:
+        return ""
+    category = raw.split("/", 1)[0].strip()
+    return category if category and category not in {".", ".."} else ""
+
+
+def _plugin_visibility_selected_provider(category: str) -> str:
+    """Read ``<category>.provider`` without surfacing config errors."""
+    if not category:
+        return ""
+    try:
+        from api.config import get_config as _get_cfg
+
+        cfg = _get_cfg() or {}
+    except Exception:
+        return ""
+    category_cfg = cfg.get(category, {}) if isinstance(cfg, dict) else {}
+    if not isinstance(category_cfg, dict):
+        return ""
+    return str(category_cfg.get("provider") or "").strip().lower()
+
+
 def _plugin_visibility_payload(manager=None) -> dict:
     """Build a sanitized plugin/hook visibility payload for Settings.
 
@@ -6326,8 +8576,12 @@ def _plugin_visibility_payload(manager=None) -> dict:
     category's ``<category>.provider`` config, not through ``plugins.enabled``.
     Their ``loaded.enabled`` stays False by design and they register hooks
     outside the four visibility hooks below. The payload surfaces ``kind``
-    and ``activation`` so the panel can render them distinctly instead of
-    mislabeling them as "Disabled" with no hooks (issue #2659).
+    and ``activation`` plus ``is_active_provider`` when the plugin key carries a
+    category prefix so the panel can render the selected provider distinctly
+    instead of mislabeling it as "Disabled" with no hooks (issue #2659), while
+    still showing unselected exclusive providers as disabled. Flat-key exclusive
+    plugins omit the new field so older activation-based badge semantics remain
+    intact when the category cannot be inferred.
     """
     manager = manager or _get_plugin_manager_for_visibility()
     manager.discover_and_load(force=False)
@@ -6349,19 +8603,31 @@ def _plugin_visibility_payload(manager=None) -> dict:
         description = _clean_plugin_visibility_text(getattr(manifest, "description", ""), limit=280)
         kind = _clean_plugin_visibility_text(getattr(manifest, "kind", "") or "standalone", limit=40)
         enabled_flag = bool(getattr(loaded, "enabled", False))
+        category = _plugin_visibility_category_from_key(plugin_key)
+        selected_provider = _plugin_visibility_selected_provider(category)
+        plugin_slug = plugin_key.rsplit("/", 1)[-1].strip().lower()
         if kind == "exclusive":
             activation = "exclusive"
         elif kind == "model-provider" and enabled_flag:
             activation = "provider"
         else:
             activation = "enabled" if enabled_flag else "disabled"
+        include_active_provider = True
+        if kind == "exclusive":
+            if category:
+                is_active_provider = bool(selected_provider) and plugin_slug == selected_provider
+            else:
+                include_active_provider = False
+                is_active_provider = False
+        else:
+            is_active_provider = kind == "model-provider" and enabled_flag
         registered = []
         for hook in list(getattr(manifest, "provides_hooks", []) or []) + list(getattr(loaded, "hooks_registered", []) or []):
             hook_name = str(hook or "").strip()
             if hook_name in _PLUGIN_VISIBILITY_HOOK_SET and hook_name not in registered:
                 registered.append(hook_name)
         registered.sort(key=_PLUGIN_VISIBILITY_HOOKS.index)
-        plugins.append({
+        plugin_payload = {
             "name": name,
             "key": plugin_key or name,
             "version": version,
@@ -6372,7 +8638,10 @@ def _plugin_visibility_payload(manager=None) -> dict:
             "kind": kind,
             "activation": activation,
             "hooks": registered,
-        })
+        }
+        if include_active_provider:
+            plugin_payload["is_active_provider"] = bool(is_active_provider)
+        plugins.append(plugin_payload)
 
     return {
         "plugins": plugins,
@@ -6505,6 +8774,122 @@ def _handle_shutdown(handler) -> bool:
     return True
 
 
+_RESTART_LOCK = threading.Lock()
+
+
+def _handle_health_restart(handler) -> bool:
+    """Restart the Hermes messaging gateway service."""
+    # Acquire the lock to prevent concurrent restart invocations
+    if not _RESTART_LOCK.acquire(blocking=False):
+        logger.warning("Gateway restart already in progress, rejecting concurrent request.")
+        return j(
+            handler,
+            {"ok": False, "error": "Restart already in progress. Please wait a moment and try again."},
+            status=429
+        )
+
+    lock_released = False
+    try:
+        # 1. Resolve HERMES_HOME for the active profile
+        active_home = get_active_hermes_home()
+
+        # 2. Build the environment dictionary with the correct HERMES_HOME
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(active_home)
+
+        # 3. Resolve the path to the hermes CLI binary
+        hermes_cmd = shutil.which("hermes")
+        if not hermes_cmd:
+            sys_exe = Path(sys.executable)
+            sibling = sys_exe.parent / "hermes"
+            if sibling.exists():
+                hermes_cmd = str(sibling)
+            else:
+                hermes_cmd = "hermes"
+
+        # 4. Run the restart command
+        logger.info("Restarting gateway service via CLI command: %s gateway restart (HERMES_HOME=%s)", hermes_cmd, active_home)
+        
+        proc = subprocess.Popen(
+            [hermes_cmd, "gateway", "restart"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env
+        )
+        try:
+            # Wait up to 2.0 seconds for the restart command to complete quickly
+            stdout, stderr = proc.communicate(timeout=2.0)
+            # Since it finished quickly, we can release the lock now
+            _RESTART_LOCK.release()
+            lock_released = True
+
+            if proc.returncode == 0:
+                logger.info("Gateway service restarted successfully: %s", stdout)
+                return j(handler, {"ok": True, "message": "Gateway service restarted successfully"})
+            else:
+                logger.error("Gateway service restart failed with code %d: %s", proc.returncode, stderr)
+                return j(
+                    handler,
+                    {"ok": False, "error": f"Restart failed: {stderr.strip() or stdout.strip()}"},
+                    status=500
+                )
+        except subprocess.TimeoutExpired:
+            # If the process doesn't finish within 2 seconds, it is likely draining
+            # in-flight agent runs. We let it continue running in the background.
+            logger.info("Gateway restart is taking longer than 2.0s (likely draining in-flight runs). Letting it run in the background.")
+
+            # Start background threads to consume the stdout/stderr streams to prevent
+            # the child process from blocking on pipe buffer limits when printing logs.
+            import threading
+
+            def consume_stream(stream):
+                try:
+                    while stream.read(4096):
+                        pass
+                except Exception:
+                    pass
+
+            def wait_and_release():
+                try:
+                    proc.wait(timeout=240.0)
+                except subprocess.TimeoutExpired:
+                    logger.error("Gateway restart process timed out after 240.0s. Terminating process.")
+                    try:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            try:
+                                proc.wait(timeout=5.0)
+                            except subprocess.TimeoutExpired:
+                                logger.error("Gateway restart process refused to die even after SIGKILL.")
+                    except Exception as e:
+                        logger.exception("Failed to terminate timed out gateway restart process: %s", e)
+                finally:
+                    try:
+                        _RESTART_LOCK.release()
+                    except RuntimeError:
+                        # Already released or similar
+                        pass
+
+            threading.Thread(target=consume_stream, args=(proc.stdout,), daemon=True).start()
+            threading.Thread(target=consume_stream, args=(proc.stderr,), daemon=True).start()
+            # This thread will release the lock when the child process exits
+            threading.Thread(target=wait_and_release, daemon=True).start()
+            
+            # Lock will be released by wait_and_release thread
+            lock_released = True
+
+            return j(handler, {"ok": True, "message": "Gateway service restart initiated (in progress)"})
+    except Exception as exc:
+        if not lock_released:
+            _RESTART_LOCK.release()
+        logger.exception("Failed to run gateway restart command")
+        return j(handler, {"ok": False, "error": f"Internal error running restart: {type(exc).__name__}: {exc}"}, status=500)
+
+
 def _serve_manifest(handler) -> bool:
     """Serve static/manifest.json with the correct PWA Content-Type.
 
@@ -6551,6 +8936,48 @@ def _save_saved_prompts(prompts: list) -> None:
     p.write_text(json.dumps(prompts, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# In-process cache for the app-shell template. The `/`, `/index.html`, and
+# `/session/<id>` routes are the hottest navigations and each re-read the
+# ~190 KB static/index.html from disk and re-ran the two process-constant
+# substitutions (__WEBUI_VERSION__, __MAX_UPLOAD_BYTES__) on every request.
+# Those values are fixed for the process lifetime, so we cache the partially
+# rendered template here, keyed by (size, nanosecond mtime) exactly like
+# _STATIC_CACHE so a redeploy is picked up without a restart. The two values
+# that genuinely vary per request — the per-session CSRF token and the runtime
+# extension tags (inject_extension_tags) — are still applied on each request
+# against the cached base, so caching changes no observable output.
+_INDEX_SHELL_CACHE: dict = {}
+_INDEX_SHELL_CACHE_LOCK = threading.Lock()
+
+
+def _render_index_shell_base() -> str:
+    """Return static/index.html with the process-constant tokens substituted.
+
+    Cached and invalidated on (size, mtime_ns) change. The CSRF token and
+    extension-tag injection are intentionally NOT applied here — they vary per
+    request and are applied by the caller against this base string.
+    """
+    from api.updates import WEBUI_VERSION
+
+    st = _INDEX_HTML_PATH.stat()
+    sig = (st.st_size, st.st_mtime_ns)
+    with _INDEX_SHELL_CACHE_LOCK:
+        cached = _INDEX_SHELL_CACHE.get("base")
+        if cached and cached[0] == sig:
+            return cached[1]
+    from urllib.parse import quote
+
+    version_token = quote(WEBUI_VERSION, safe="")
+    base = (
+        _INDEX_HTML_PATH.read_text(encoding="utf-8")
+        .replace("__WEBUI_VERSION__", version_token)
+        .replace("__MAX_UPLOAD_BYTES__", str(MAX_UPLOAD_BYTES))
+    )
+    with _INDEX_SHELL_CACHE_LOCK:
+        _INDEX_SHELL_CACHE["base"] = (sig, base)
+    return base
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
 
@@ -6572,9 +8999,6 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path in ("/", "/index.html") or parsed.path.startswith("/session/"):
         try:
-            from urllib.parse import quote
-            from api.updates import WEBUI_VERSION
-            version_token = quote(WEBUI_VERSION, safe="")
             from api.extensions import inject_extension_tags
 
             csrf_token = ""
@@ -6588,11 +9012,11 @@ def handle_get(handler, parsed) -> bool:
             except Exception:
                 csrf_token = ""
 
-            html = (
-                _INDEX_HTML_PATH.read_text(encoding="utf-8")
-                .replace("__WEBUI_VERSION__", version_token)
-                .replace("__MAX_UPLOAD_BYTES__", str(MAX_UPLOAD_BYTES))
-                .replace("__CSRF_TOKEN_JSON__", json.dumps(csrf_token))
+            # The disk read + process-constant token substitutions are cached;
+            # only the per-session CSRF token and per-request extension tags are
+            # applied here (see _render_index_shell_base).
+            html = _render_index_shell_base().replace(
+                "__CSRF_TOKEN_JSON__", json.dumps(csrf_token)
             )
             return t(
                 handler,
@@ -6650,6 +9074,7 @@ def handle_get(handler, parsed) -> bool:
             "passkeys_enabled": bool(passkeys),
             "passkeys_count": len(passkeys),
             "passkey_feature_flag": passkey_flag,
+            "auth_disabled_acknowledged": bool(load_settings().get("auth_disabled_acknowledged")) if not auth_enabled else False,
         })
 
     if parsed.path in ("/manifest.json", "/manifest.webmanifest"):
@@ -6712,6 +9137,92 @@ def handle_get(handler, parsed) -> bool:
         return True
     if parsed.path == "/api/wiki/status":
         return _handle_llm_wiki_status(handler, parsed)
+    if parsed.path == "/api/wiki/browse":
+        wiki_root, _, _ = _llm_wiki_resolve_path()
+        if not wiki_root or not os.path.isdir(wiki_root):
+            return bad(handler, "Wiki not configured or directory not found", status=404)
+        allowlisted_entries = _llm_wiki_allowlisted_entries(Path(wiki_root))
+        pages = []
+        for rel_path, (fp, identity) in sorted(allowlisted_entries.items(), key=lambda item: item[0].lower()):
+            try:
+                st = fp.stat()
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) != identity:
+                continue
+            pages.append({"name": Path(rel_path).name, "path": rel_path, "size": st.st_size, "mtime": int(st.st_mtime)})
+        return j(handler, {"pages": pages})
+    if parsed.path == "/api/wiki/page":
+        wiki_root, _, _ = _llm_wiki_resolve_path()
+        page_path = parse_qs(parsed.query or "").get("path", [""])[0]
+        if not wiki_root or not page_path:
+            return bad(handler, "Wiki not configured or path not provided", status=400)
+        if "\\" in page_path:
+            return bad(handler, "Invalid path", status=400)
+        # Reject a real `..` path SEGMENT (or absolute path), not the bare
+        # substring — a legitimate listed filename like `v1..v2.md` contains
+        # ".." without being traversal. Containment + the resolved-allowlist
+        # membership check below are the actual security boundary.
+        requested_key = page_path.replace("\\", "/")
+        _page_parts = requested_key.split("/")
+        if os.path.isabs(page_path) or any(part == ".." for part in _page_parts):
+            return bad(handler, "Invalid path", status=400)
+        if any(part in ("", ".") for part in _page_parts):
+            return bad(handler, "Invalid path", status=400)
+        full_path = Path(os.path.join(wiki_root, page_path))
+        if not _skill_path_within(Path(wiki_root), full_path):
+            return bad(handler, "Invalid path", status=400)
+        try:
+            wiki_real = Path(wiki_root).resolve()
+        except OSError:
+            return bad(handler, "Page not found", status=404)
+        # Only serve files the browse/list path would surface (same allowlist:
+        # *.md under the wiki page-dirs, no dotfiles, forbidden-roots guard).
+        # Without this the read endpoint could return ANY file inside the wiki
+        # root (e.g. .env / .git/config / non-.md), since containment alone
+        # doesn't constrain which files are readable (Opus review finding).
+        # Capture each allowlisted page's STABLE IDENTITY (st_dev, st_ino) so the
+        # post-open fstat below can detect a file/parent-dir swapped in after the
+        # allowlist check (TOCTOU write-race, Codex finding) — a pathname re-open
+        # alone can't, since O_NOFOLLOW only guards the final component, not a
+        # swapped parent directory.
+        allowed_identity = _llm_wiki_allowlisted_entries(wiki_real)
+        try:
+            resolved_target = full_path.resolve()
+        except OSError:
+            return bad(handler, "Page not found", status=404)
+        requested_entry = allowed_identity.get(requested_key)
+        if requested_entry is None:
+            return bad(handler, "Page not found", status=404)
+        allowlisted_target, allowlisted_identity = requested_entry
+        if resolved_target != allowlisted_target:
+            return bad(handler, "Page not found", status=404)
+        # Read the ALREADY-RESOLVED, allowlisted real path with O_NOFOLLOW so a
+        # symlink swapped in for the final component between the allowlist check
+        # and the read is refused rather than followed. Then fstat the open fd
+        # and require its (st_dev, st_ino) to match the identity captured during
+        # allowlisting — this closes a parent-directory swap that O_NOFOLLOW
+        # would otherwise follow. Any mismatch / vanished / swapped page returns
+        # a clean 404, never a 500.
+        try:
+            fd = os.open(str(resolved_target), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                st_open = os.fstat(fd)
+                if (st_open.st_dev, st_open.st_ino) != allowlisted_identity:
+                    return bad(handler, "Page not found", status=404)
+                raw = os.read(fd, _LLM_WIKI_MAX_PAGE_BYTES + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > _LLM_WIKI_MAX_PAGE_BYTES:
+                raw = raw[:_LLM_WIKI_MAX_PAGE_BYTES]
+            content = raw.decode("utf-8", errors="replace")
+        except (FileNotFoundError, IsADirectoryError):
+            return bad(handler, "Page not found", status=404)
+        except OSError:
+            # ELOOP (symlink swapped in under O_NOFOLLOW) or any other read
+            # failure → clean 404, never a 500.
+            return bad(handler, "Could not read page", status=404)
+        return j(handler, {"content": content, "path": page_path})
     if parsed.path == "/api/logs":
         return _handle_logs(handler, parsed)
 
@@ -6734,10 +9245,17 @@ def handle_get(handler, parsed) -> bool:
         # the detached rebuild worker (and the legacy synchronous rebuild),
         # which the request-thread wrapper could not reach. See
         # api.config.get_available_models cold path + profile_scope_for_detached_worker.
+        freshness = parse_qs(parsed.query or "").get("freshness", [""])[0].strip().lower()
+        if freshness == "session_visit":
+            return j(handler, get_available_models_for_session_visit())
+        if freshness:
+            return bad(handler, f"unknown models freshness: {freshness}", status=400)
         return j(handler, get_available_models())
 
     if parsed.path == "/api/models/live":
-        return _handle_live_models(handler, parsed)
+        from api.profiles import profile_env_for_active_request
+        with profile_env_for_active_request("/api/models/live", logger_override=logger):
+            return _handle_live_models(handler, parsed)
 
     # ── Auxiliary models (GET/POST) ──
     if parsed.path == "/api/model/auxiliary":
@@ -6779,8 +9297,8 @@ def handle_get(handler, parsed) -> bool:
         # profile's (#3957). Without this, get_auth_status() probes on a
         # non-default profile resolve the wrong/empty creds and can stall past
         # the 30s frontend timeout. No-op for the default profile.
-        from api.profiles import profile_env_for_active_request
-        with profile_env_for_active_request("/api/providers", logger_override=logger):
+        from api.profiles import profile_env_for_active_request_readonly
+        with profile_env_for_active_request_readonly("/api/providers", logger_override=logger):
             return j(handler, get_providers())
 
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
@@ -6790,7 +9308,15 @@ def handle_get(handler, parsed) -> bool:
         query = parse_qs(parsed.query)
         provider_id = (query.get("provider", [""])[0] or None)
         refresh = (query.get("refresh", [""])[0] or "").strip().lower() in {"1", "true", "yes", "on"}
-        return j(handler, get_provider_quota(provider_id, refresh=refresh))
+        # Bind the active request's profile env (matches /api/providers and
+        # /api/models/live). #4365 added a credential_pool.load_pool() path in
+        # get_provider_quota for all pooled providers; without this wrapper that
+        # read/write runs under the process-default profile, so a multi-profile
+        # client would see (and seed) the default profile's pool instead of its
+        # own (#4247/#4067 profile-isolation class).
+        from api.profiles import profile_env_for_active_request_readonly
+        with profile_env_for_active_request_readonly("/api/provider/quota", logger_override=logger):
+            return j(handler, get_provider_quota(provider_id, refresh=refresh))
 
     # ── Cron live activity tracker ──────────────────────────────────────
     if parsed.path == "/api/cron/live-status":
@@ -6821,6 +9347,21 @@ def handle_get(handler, parsed) -> bool:
         settings["password_env_var"] = bool(
             os.getenv("HERMES_WEBUI_PASSWORD", "").strip()
         )
+        # Auth-state fields for frontend safety badge / confirmation flows
+        from api.auth import get_password_hash, is_auth_enabled
+        settings["auth_enabled"] = is_auth_enabled()
+        settings["password_auth_enabled"] = get_password_hash() is not None
+        try:
+            from api.auth import _passkey_feature_flag_enabled as _pffe
+            from api.passkeys import registered_credentials as _rc
+            if _pffe():
+                settings["passkeys_enabled"] = bool(_rc())
+                settings["passwordless_enabled"] = bool(_rc()) and not settings["password_auth_enabled"]
+            else:
+                settings["passkeys_enabled"] = False
+                settings["passwordless_enabled"] = False
+        except Exception:
+            pass
         # Inject the running version so the UI badge stays in sync with git tags
         # without any manual release step.
         try:
@@ -6853,6 +9394,11 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/onboarding/status":
         return j(handler, get_onboarding_status())
+
+    if parsed.path == "/api/extensions/status":
+        from api.extensions import get_extension_status
+
+        return j(handler, get_extension_status())
 
     if parsed.path.startswith("/extensions/"):
         from api.extensions import serve_extension_static
@@ -7017,6 +9563,12 @@ def handle_get(handler, parsed) -> bool:
                 )
                 if msg_limit is not None:
                     _truncated_msgs = _messages_for_limited_payload(_truncated_msgs)
+                _truncated_msgs = _hydrate_anchor_activity_scenes(
+                    _truncated_msgs,
+                    getattr(s, "anchor_activity_scenes", None),
+                    message_offset=_messages_offset,
+                    tool_calls=getattr(s, "tool_calls", None),
+                )
             else:
                 _truncated_msgs = []
                 _messages_offset = 0
@@ -7042,19 +9594,46 @@ def handle_get(handler, parsed) -> bool:
             _persisted_cl = getattr(s, "context_length", 0) or 0
             _threshold_tokens = getattr(s, "threshold_tokens", 0) or 0
             if (not _persisted_cl) or resolve_model:
+                _stored_model_for_lookup = getattr(s, "model", "") or ""
+                _stored_provider_for_lookup = getattr(s, "model_provider", None) or ""
                 _model_for_lookup = (
-                    effective_model or getattr(s, "model", "") or ""
+                    effective_model or _stored_model_for_lookup
                 ).strip()
-                _fb_cl = _resolve_context_length_for_session_model(
+                (
+                    _model_for_lookup,
+                    _provider_for_lookup,
+                    _base_url_for_lookup,
+                    _api_key_for_lookup,
+                ) = _session_context_length_lookup_state(
                     _model_for_lookup,
                     effective_provider or getattr(s, "model_provider", None) or "",
                 )
-                if _fb_cl:
+                _fb_cl = _resolve_context_length_for_session_model(
+                    _model_for_lookup,
+                    _provider_for_lookup,
+                    base_url=_base_url_for_lookup,
+                    api_key=_api_key_for_lookup,
+                )
+                _model_changed_for_context = not _session_model_identity_matches(
+                    _stored_model_for_lookup,
+                    _stored_provider_for_lookup,
+                    _model_for_lookup,
+                    _provider_for_lookup,
+                )
+                if _should_accept_session_context_length_refresh(
+                    _persisted_cl,
+                    _fb_cl,
+                    model_changed=_model_changed_for_context,
+                ):
                     if _persisted_cl and _fb_cl != _persisted_cl:
                         # The old threshold belongs to the old window. Hiding it
-                        # is less misleading than rendering a stale compression
-                        # threshold against a freshly resolved context length.
-                        _threshold_tokens = 0
+                        # is less useful than keeping the same compression ratio
+                        # against the freshly resolved context length.
+                        _threshold_tokens = _rescale_threshold_tokens_for_context_window(
+                            _threshold_tokens,
+                            _persisted_cl,
+                            _fb_cl,
+                        )
                     _persisted_cl = _fb_cl
             _session_tool_calls = getattr(s, "tool_calls", []) if load_messages else []
             # Always include session-level tool_calls so the browser can merge
@@ -7095,6 +9674,7 @@ def handle_get(handler, parsed) -> bool:
                 "pending_user_message": getattr(s, "pending_user_message", None),
                 "pending_attachments": getattr(s, "pending_attachments", []) if load_messages else [],
                 "pending_started_at": getattr(s, "pending_started_at", None),
+                "pending_user_source": getattr(s, "pending_user_source", None),
                 "context_length": _persisted_cl,
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
@@ -7140,7 +9720,14 @@ def handle_get(handler, parsed) -> bool:
                     float(raw.get("updated_at") or 0),
                     _merged_last_message_at,
                 )
-            if cli_meta and _is_messaging_session_record(cli_meta):
+            # #2980: surface the visible continuation for a hidden pre-compression
+            # snapshot so a mobile reload mid-compression can recover to it.
+            continuation_sid = _pre_compression_continuation_session_id(s)
+            if continuation_sid:
+                raw["continuation_session_id"] = continuation_sid
+            if cli_meta and _session_source_is_webui(cli_meta):
+                raw = _reconcile_session_detail_source_flags(raw, cli_meta)
+            elif cli_meta and _is_messaging_session_record(cli_meta):
                 raw = _merge_cli_sidebar_metadata(raw, cli_meta)
                 # ``message_count`` in /api/session is the display coordinate
                 # space used for pagination and the header badge. Messaging
@@ -7318,14 +9905,25 @@ def handle_get(handler, parsed) -> bool:
             show_cron_sessions = bool(settings.get("show_cron_sessions"))
             agent_session_source_filter = settings.get("agent_session_source_filter")
             active_profile = get_active_profile_name()
-            all_profiles = _all_profiles_query_flag(parsed)
+            all_profiles = _all_profiles_enabled(parsed)
+            include_archived = _query_flag(parsed, "include_archived")
+            exclude_hidden = _query_flag(parsed, "exclude_hidden")
+            sidebar_source = parse_qs(parsed.query).get("sidebar_source", [""])[0].strip().lower() or None
+            if sidebar_source not in ("webui", "cli"):
+                sidebar_source = None
+            # /api/sessions is the default sidebar contract, so keep the route-owned
+            # visible-row filter in the shared cache builder for both cache hits and misses.
             key = _session_list_cache_key(
                 active_profile=active_profile,
                 all_profiles=all_profiles,
                 show_cli_sessions=show_cli_sessions,
                 show_previous_messaging_sessions=show_previous_messaging_sessions,
                 show_cron_sessions=show_cron_sessions,
+                include_archived=include_archived,
+                exclude_hidden=exclude_hidden,
+                visible_only=True,
                 source_filter=agent_session_source_filter,
+                sidebar_source=sidebar_source,
             )
             # Keep the visible /api/sessions contract unchanged even though the
             # heavy lifting now lives in the cache builder: profile scoping via
@@ -7339,13 +9937,17 @@ def handle_get(handler, parsed) -> bool:
                     show_cli_sessions=show_cli_sessions,
                     show_previous_messaging_sessions=show_previous_messaging_sessions,
                     show_cron_sessions=show_cron_sessions,
+                    include_archived=include_archived,
+                    exclude_hidden=exclude_hidden,
+                    visible_only=True,
                     source_filter=agent_session_source_filter,
+                    sidebar_source=sidebar_source,
                     diag=diag,
                 ),
                 diag=diag,
             )
             diag.stage("response_write")
-            return j(handler, _session_list_payload_to_response(payload))
+            return j(handler, _session_list_payload_to_response(payload), pretty=False)
         finally:
             diag.finish()
 
@@ -7356,17 +9958,20 @@ def handle_get(handler, parsed) -> bool:
         from api.profiles import get_active_profile_name
         active_profile = get_active_profile_name()
         all_projects = load_projects()
-        all_profiles = _all_profiles_query_flag(parsed)
+        isolated_profile_mode = _is_isolated_profile_mode()
+        all_profiles = _all_profiles_enabled(parsed)
         if all_profiles:
             scoped = all_projects
+            other_profile_count = 0
         else:
             scoped = [p for p in all_projects
                       if _profiles_match(p.get("profile"), active_profile)]
+            other_profile_count = 0 if isolated_profile_mode else len(all_projects) - len(scoped)
         return j(handler, {
             "projects": scoped,
             "all_profiles": all_profiles,
             "active_profile": active_profile,
-            "other_profile_count": len(all_projects) - len(scoped),
+            "other_profile_count": other_profile_count,
         })
 
     if parsed.path == "/api/prompts":
@@ -7401,6 +10006,9 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/list":
         return _handle_list_dir(handler, parsed)
+
+    if parsed.path == "/api/escape/list":
+        return _handle_escape_list_dir(handler, parsed)
 
     if parsed.path == "/api/git/status":
         return _handle_git_status(handler, parsed)
@@ -7552,11 +10160,17 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/file/raw":
         return _handle_file_raw(handler, parsed)
 
+    if parsed.path == "/api/escape/file/raw":
+        return _handle_escape_file_raw(handler, parsed)
+
     if parsed.path == "/api/folder/download":
         return _handle_folder_download(handler, parsed)
 
     if parsed.path == "/api/file":
         return _handle_file_read(handler, parsed)
+
+    if parsed.path == "/api/escape/file/read":
+        return _handle_escape_file_read(handler, parsed)
 
     if parsed.path == "/api/approval/pending":
         return _handle_approval_pending(handler, parsed)
@@ -7729,11 +10343,18 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
-        from api.profiles import list_profiles_api, get_active_profile_name
+        from api.profiles import (
+            get_active_profile_name,
+            list_profiles_api,
+        )
 
         return j(
             handler,
-            {"profiles": list_profiles_api(), "active": get_active_profile_name()},
+            {
+                "profiles": list_profiles_api(),
+                "active": get_active_profile_name(),
+                "single_profile_mode": _is_isolated_profile_mode(),
+            },
         )
 
     if parsed.path == "/api/profile/active":
@@ -7755,97 +10376,7 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Gateway Status (GET) ──
     if parsed.path == "/api/gateway/status":
-        import datetime
-        identity_map = _load_gateway_session_identity_map()
-        sessions_path = _gateway_session_metadata_path()
-
-        # Detect whether the gateway process is alive, independent of
-        # connected messaging platforms.  An empty identity_map just
-        # means zero platforms connected, not that the gateway is down.
-        #
-        # agent_health.build_agent_health_payload() is the authoritative
-        # signal: it reads gateway.status runtime metadata and returns a
-        # tri-state `alive` field (True/False/None).  This avoids the
-        # false-negative where the gateway is running but has zero active
-        # messaging sessions (empty identity_map).
-        #
-        # `alive` tri-state semantics:
-        #   True  → gateway process is alive
-        #   False → gateway metadata exists but process is down
-        #   None  → no gateway metadata/status available; this WebUI
-        #           setup is probably not configured with a gateway
-        health = build_agent_health_payload()
-        alive = health.get("alive")
-        details = health.get("details") if isinstance(health.get("details"), dict) else {}
-        health_reason = details.get("reason")
-        health_state = details.get("state")
-        health_gateway_state = details.get("gateway_state")
-        if alive is True:
-            running = True
-            configured = True
-        elif alive is False:
-            running = False
-            configured = True
-        else:  # alive is None
-            # `alive is None` conflates two very different states:
-            #   (a) no gateway metadata at all → genuinely not configured
-            #   (b) gateway metadata EXISTS but is stale/inconclusive.
-            # A stale-but-RUNNING gateway (freshly started, hasn't ticked
-            # `updated_at` yet, or cross-container) still proves the gateway is
-            # *configured* — the banner must not report "Gateway not configured"
-            # just because no conversation has happened yet and identity_map is
-            # empty (#3194).
-            #
-            # A stale-STOPPED gateway is deliberately NOT treated as configured:
-            # agent_health emits `gateway_stale_stopped_state` precisely so a
-            # stopped service the user isn't running reads like "no root gateway
-            # configured" rather than nagging (#1944). So stale-stopped falls
-            # through to the identity_map signal like the genuinely-unconfigured
-            # case.
-            gateway_running_metadata = (
-                health_reason == "gateway_stale_running_state"
-                or health_gateway_state == "running"
-            )
-            configured = True if gateway_running_metadata else bool(identity_map)
-            running = bool(identity_map)
-
-        platforms_set: set[str] = set()
-        for meta in identity_map.values():
-            raw = meta.get("raw_source") or meta.get("platform") or ""
-            norm = _normalize_messaging_source(raw)
-            if norm:
-                platforms_set.add(norm)
-        _PLATFORM_LABELS = {
-            "telegram": "Telegram",
-            "discord": "Discord",
-            "slack": "Slack",
-            "email": "Email",
-            "web": "Web",
-            "api": "API",
-        }
-        platforms = sorted(
-            [{"name": p, "label": _PLATFORM_LABELS.get(p, p.title())} for p in platforms_set],
-            key=lambda x: x["label"],
-        )
-        last_active = ""
-        if running and sessions_path.exists():
-            try:
-                mtime = sessions_path.stat().st_mtime
-                last_active = datetime.datetime.fromtimestamp(mtime).isoformat()
-            except Exception:
-                pass
-        return j(handler, {
-            "running": running,
-            "configured": configured,
-            "platforms": platforms,
-            "last_active": last_active,
-            "session_count": len(identity_map),
-            "health": {
-                "state": health_state,
-                "reason": health_reason,
-                "gateway_state": health_gateway_state,
-            },
-        })
+        return j(handler, _gateway_status_payload())
 
     # ── MCP Servers (GET) ──
     if parsed.path == "/api/mcp/servers":
@@ -8041,6 +10572,16 @@ def _require_passkey_registration_auth(handler) -> tuple[bool, str, int]:
         return False, "Authentication required", 401
     return True, "", 200
 
+def _validate_session_toolsets_shape(toolsets):
+    """Validate per-session toolset override shape without catalog lookup."""
+    if toolsets is None:
+        return None
+    if not isinstance(toolsets, list) or not toolsets:
+        raise ValueError("toolsets must be a non-empty list or null")
+    if not all(isinstance(t, str) and t for t in toolsets):
+        raise ValueError("each toolset must be a non-empty string")
+    return toolsets
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger)
@@ -8098,6 +10639,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/shutdown":
         return _handle_shutdown(handler)
 
+    if parsed.path == "/api/health/restart":
+        return _handle_health_restart(handler)
+
     if parsed.path == "/api/upload":
         return handle_upload(handler)
     if parsed.path == "/api/upload/extract":
@@ -8130,6 +10674,9 @@ def handle_post(handler, parsed) -> bool:
             diag.finish()
         raise
 
+    if parsed.path == "/api/escape/authorize":
+        return _handle_escape_authorize(handler, parsed, body)
+
     if parsed.path == "/api/updates/check":
         settings = load_settings()
         if not settings.get("check_for_updates", True):
@@ -8139,6 +10686,20 @@ def handle_post(handler, parsed) -> bool:
         from api.updates import check_for_updates
 
         return j(handler, check_for_updates(force=force, include_agent=include_agent_updates))
+
+    if parsed.path == "/api/extensions/toggle":
+        from api.extensions import ExtensionToggleError, set_extension_user_enabled
+
+        try:
+            return j(
+                handler,
+                set_extension_user_enabled(body.get("id"), body.get("enabled")),
+            )
+        except ExtensionToggleError as exc:
+            return bad(handler, str(exc), status=exc.status)
+        except Exception:
+            logger.exception("extension toggle failed")
+            return bad(handler, "Failed to update extension state", status=500)
 
     if parsed.path == "/api/session/recovery/repair-safe":
         from api.session_recovery import repair_safe_session_recovery
@@ -8206,6 +10767,10 @@ def handle_post(handler, parsed) -> bool:
             body.get("model"),
             body.get("model_provider"),
         )
+        try:
+            enabled_toolsets = _validate_session_toolsets_shape(body.get("enabled_toolsets"))
+        except ValueError as e:
+            return bad(handler, str(e), status=400)
         # Use the profile sent by the client tab (if any) so that two tabs on
         # different profiles never clobber each other via the process-level global.
         # ── Memory lifecycle: commit the previous session before starting a new one ──
@@ -8229,6 +10794,7 @@ def handle_post(handler, parsed) -> bool:
             profile=body.get("profile") or None,
             project_id=body.get("project_id") or None,
             worktree_info=worktree_info,
+            enabled_toolsets=enabled_toolsets,
         )
         if worktree_info:
             publish_session_list_changed(
@@ -8442,6 +11008,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/sessions/cleanup_zero_message":
         return _handle_sessions_cleanup(handler, body, zero_only=True)
 
+    if parsed.path == "/api/session/anchor-scene":
+        return _handle_session_anchor_scene(handler, body)
+
     if parsed.path == "/api/session/rename":
         try:
             require(body, "session_id", "title")
@@ -8548,12 +11117,10 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e))
         sid = body["session_id"]
         toolsets = body.get("toolsets")
-        # Validate: if not None, must be a non-empty list of strings
-        if toolsets is not None:
-            if not isinstance(toolsets, list) or not toolsets:
-                return bad(handler, "toolsets must be a non-empty list or null")
-            if not all(isinstance(t, str) and t for t in toolsets):
-                return bad(handler, "each toolset must be a non-empty string")
+        try:
+            toolsets = _validate_session_toolsets_shape(toolsets)
+        except ValueError as e:
+            return bad(handler, str(e), status=400)
         try:
             s = get_session(sid)
         except KeyError:
@@ -9255,6 +11822,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/memory/write":
         return _handle_memory_write(handler, body)
 
+    if parsed.path in {"/api/gateway/start", "/api/gateway/stop", "/api/gateway/restart"}:
+        return _handle_gateway_lifecycle(handler, parsed.path.rsplit("/", 1)[-1], body)
+
     # ── Profile API (POST) ──
     if parsed.path == "/api/profile/switch":
         name = body.get("name", "").strip()
@@ -9281,6 +11851,8 @@ def handle_post(handler, parsed) -> bool:
             return j(handler, result, extra_headers={
                 'Set-Cookie': build_profile_cookie(name, handler),
             })
+        except PermissionError as e:
+            return bad(handler, _sanitize_error(e), 403)
         except (ValueError, FileNotFoundError) as e:
             return bad(handler, _sanitize_error(e), 404)
         except RuntimeError as e:
@@ -9321,6 +11893,8 @@ def handle_post(handler, parsed) -> bool:
                 model_provider=model_provider,
             )
             return j(handler, {"ok": True, "profile": result})
+        except PermissionError as e:
+            return bad(handler, _sanitize_error(e), 403)
         except (ValueError, FileExistsError, RuntimeError) as e:
             return bad(handler, str(e))
 
@@ -9334,6 +11908,8 @@ def handle_post(handler, parsed) -> bool:
             _validate_profile_name(name)
             result = delete_profile_api(name)
             return j(handler, result)
+        except PermissionError as e:
+            return bad(handler, _sanitize_error(e), 403)
         except (ValueError, FileNotFoundError) as e:
             return bad(handler, _sanitize_error(e))
         except RuntimeError as e:
@@ -9343,9 +11919,11 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/settings":
         from api.auth import (
             create_session,
+            get_password_hash,
             is_auth_enabled,
             parse_cookie,
             set_auth_cookie,
+            verify_password,
             verify_session,
         )
 
@@ -9353,6 +11931,7 @@ def handle_post(handler, parsed) -> bool:
             body["bot_name"] = (str(body["bot_name"]) or "").strip() or "Hermes"
 
         auth_enabled_before = is_auth_enabled()
+        password_auth_enabled_before = auth_enabled_before and get_password_hash() is not None
         current_cookie = parse_cookie(handler)
         logged_in_before = bool(current_cookie and verify_session(current_cookie))
         requested_password = bool(
@@ -9363,6 +11942,8 @@ def handle_post(handler, parsed) -> bool:
         requested_clear_password = bool(body.get("_clear_password") or requested_passwordless)
         if requested_passwordless:
             body["_clear_password"] = True
+
+        current_password = body.pop("_current_password", None)
 
         # #1560: HERMES_WEBUI_PASSWORD env var takes precedence in
         # api.auth.get_password_hash(), so writing password_hash to settings.json
@@ -9392,6 +11973,22 @@ def handle_post(handler, parsed) -> bool:
                     403,
                 )
 
+        # Auth-disable safety: when password auth is currently enabled, require
+        # the current password to change, clear, or switch to passwordless.
+        if auth_enabled_before and password_auth_enabled_before and (requested_password or requested_clear_password):
+            if not isinstance(current_password, str) or not current_password:
+                return bad(
+                    handler,
+                    "Current password is required to change or disable authentication.",
+                    403,
+                )
+            if not verify_password(current_password):
+                return bad(
+                    handler,
+                    "Current password is incorrect.",
+                    403,
+                )
+
         if requested_passwordless:
             from api.auth import _passkey_feature_flag_enabled
             from api.passkeys import registered_credentials
@@ -9405,8 +12002,42 @@ def handle_post(handler, parsed) -> bool:
 
             clear_credentials()
 
+        # Handle auth_disabled_acknowledged setting
+        ack = body.pop("_auth_disabled_acknowledged", None)
+        if ack is not None and not is_auth_enabled():
+            body["auth_disabled_acknowledged"] = bool(ack)
+        elif is_auth_enabled() or requested_password:
+            body["auth_disabled_acknowledged"] = False
+
         saved = save_settings(body)
         saved.pop("password_hash", None)  # never expose hash to client
+
+        # Settings that change which sessions appear in the sidebar must
+        # invalidate the session-list cache directly. Relying on the cache's
+        # settings-file mtime stamp is fragile: a toggle that writes the
+        # settings file within the same mtime granularity as a cached entry (and
+        # produces the default-valued key, e.g. show_cli_sessions back to its
+        # True default) can leave a stale row set served for up to the cache TTL.
+        # This is the root cause of the intermittent gateway_sync test flake
+        # (a freshly-inserted CLI/gateway session occasionally absent from
+        # /api/sessions right after the visibility toggle). Invalidate explicitly.
+        if any(
+            k in body
+            for k in (
+                "show_cli_sessions",
+                "show_cron_sessions",
+                "show_previous_messaging_sessions",
+            )
+        ):
+            try:
+                _clear_session_list_cache()
+            except Exception:
+                pass
+            try:
+                from api.models import clear_cli_sessions_cache
+                clear_cli_sessions_cache()
+            except Exception:
+                pass
 
         auth_enabled_after = is_auth_enabled()
         auth_just_enabled = bool(
@@ -9420,8 +12051,20 @@ def handle_post(handler, parsed) -> bool:
             logged_in_after = True
 
         saved["auth_enabled"] = auth_enabled_after
+        saved["password_auth_enabled"] = get_password_hash() is not None
         saved["logged_in"] = logged_in_after
         saved["auth_just_enabled"] = auth_just_enabled
+        try:
+            from api.auth import _passkey_feature_flag_enabled as _pffe
+            from api.passkeys import registered_credentials as _rc
+            if _pffe():
+                saved["passkeys_enabled"] = bool(_rc())
+                saved["passwordless_enabled"] = bool(_rc()) and not saved["password_auth_enabled"]
+            else:
+                saved["passkeys_enabled"] = False
+                saved["passwordless_enabled"] = False
+        except Exception:
+            pass
 
         if not new_cookie:
             return j(handler, saved)
@@ -9601,7 +12244,7 @@ def handle_post(handler, parsed) -> bool:
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                 )
-                s.is_cli_session = True
+                s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
                 s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
                 s.session_source = cli_meta.get("session_source")
@@ -9626,7 +12269,7 @@ def handle_post(handler, parsed) -> bool:
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                 )
-                s.is_cli_session = True
+                s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
                 s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
                 s.session_source = cli_meta.get("session_source")
@@ -10377,7 +13020,7 @@ def _handle_sessions_search(handler, parsed):
     content_search = qs.get("content", ["1"])[0] == "1"
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
-    all_profiles = _all_profiles_query_flag(parsed)
+    all_profiles = _all_profiles_enabled(parsed)
     sessions = all_sessions()
     if not all_profiles:
         sessions = [
@@ -10474,6 +13117,137 @@ def _handle_list_dir(handler, parsed):
         )
     except (FileNotFoundError, ValueError) as e:
         return bad(handler, _sanitize_error(e), 404)
+
+
+def _read_json_request_body(handler, *, max_bytes: int = 4096) -> dict:
+    try:
+        length = _safe_content_length(handler, max_bytes)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(_sanitize_error(exc)) from exc
+    raw = handler.rfile.read(length) if length else b"{}"
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("invalid JSON body") from exc
+    return payload if isinstance(payload, dict) else {}
+
+
+def _handle_escape_authorize(handler, parsed, body: dict | None = None):
+    if handler.command != "POST":
+        return bad(handler, "method not allowed", 405)
+    if not handler.headers.get("Origin"):
+        return bad(handler, "browser origin required", 403)
+    if not _check_csrf(handler):
+        return bad(handler, _csrf_rejection_error(handler), 403)
+    if body is None:
+        try:
+            body = _read_json_request_body(handler)
+        except ValueError as exc:
+            return bad(handler, _sanitize_error(exc), 400)
+    qs = parse_qs(parsed.query)
+    sid = str(body.get("session_id") or qs.get("session_id", [""])[0] or "").strip()
+    rel = str(body.get("path") or qs.get("path", [""])[0] or "").strip()
+    token = str(body.get("token") or qs.get("token", [""])[0] or "").strip()
+    if token:
+        return bad(handler, "token must not be provided", 400)
+    if not sid:
+        return bad(handler, "session_id is required")
+    if not rel:
+        return bad(handler, "path is required")
+    try:
+        s = get_session_for_file_ops(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    try:
+        payload = authorize_escape_target(Path(s.workspace), sid, rel)
+    except ValueError as exc:
+        return bad(handler, _sanitize_error(exc), 404)
+    return j(handler, payload)
+
+
+def _handle_escape_list_dir(handler, parsed):
+    qs = parse_qs(parsed.query)
+    sid = qs.get("session_id", [""])[0]
+    token = qs.get("token", [""])[0]
+    if not sid:
+        return bad(handler, "session_id is required")
+    if not token:
+        return bad(handler, "token is required")
+    try:
+        s = get_session_for_file_ops(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    rel_path = qs.get("path", ["."])[0]
+    try:
+        payload = list_authorized_escape_dir(Path(s.workspace), sid, token, rel_path)
+        return j(handler, payload)
+    except FileNotFoundError as exc:
+        return bad(handler, _sanitize_error(exc), 404)
+    except EscapeAuthorizationExpiredError as exc:
+        return bad(handler, _sanitize_error(exc), 403)
+    except ValueError as exc:
+        return bad(handler, _sanitize_error(exc), 404)
+
+
+def _handle_escape_file_read(handler, parsed):
+    qs = parse_qs(parsed.query)
+    sid = qs.get("session_id", [""])[0]
+    token = qs.get("token", [""])[0]
+    if not sid:
+        return bad(handler, "session_id is required")
+    if not token:
+        return bad(handler, "token is required")
+    try:
+        s = get_session_for_file_ops(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    rel = qs.get("path", [""])[0]
+    try:
+        return j(handler, read_authorized_escape_file_content(Path(s.workspace), sid, token, rel))
+    except FileNotFoundError as exc:
+        return bad(handler, _sanitize_error(exc), 404)
+    except EscapeAuthorizationExpiredError as exc:
+        return bad(handler, _sanitize_error(exc), 403)
+    except ValueError as exc:
+        return bad(handler, _sanitize_error(exc), 404)
+
+
+def _handle_escape_file_raw(handler, parsed):
+    qs = parse_qs(parsed.query)
+    sid = qs.get("session_id", [""])[0]
+    token = qs.get("token", [""])[0]
+    if not sid:
+        return bad(handler, "session_id is required")
+    if not token:
+        return bad(handler, "token is required")
+    try:
+        s = get_session_for_file_ops(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    rel = qs.get("path", [""])[0]
+    force_download = qs.get("download", [""])[0] == "1"
+    try:
+        anchor_root, target = raw_authorized_escape_target(Path(s.workspace), sid, token, rel)
+    except FileNotFoundError:
+        return j(handler, {"error": "not found"}, status=404)
+    except EscapeAuthorizationExpiredError as exc:
+        return bad(handler, _sanitize_error(exc), 403)
+    except ValueError as exc:
+        return bad(handler, _sanitize_error(exc), 404)
+    if not target.exists() or not target.is_file():
+        return j(handler, {"error": "not found"}, status=404)
+    ext = target.suffix.lower()
+    mime = MIME_MAP.get(ext, "application/octet-stream")
+    inline_preview = qs.get("inline", [""])[0] == "1"
+    dangerous_types = {"text/html", "application/xhtml+xml", "image/svg+xml"}
+    html_inline_ok = inline_preview and mime == "text/html"
+    disposition = "attachment" if force_download or (mime in dangerous_types and not html_inline_ok) else "inline"
+    sandbox_csp = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"
+    # Content-Security-Policy sandboxing is carried through the csp=sandbox_csp handoff below.
+    csp = sandbox_csp if (inline_preview and not force_download and disposition == "inline") else None
+    if html_inline_ok:
+        return _serve_inline_html_preview(handler, target, "no-store", csp=sandbox_csp, anchor_root=anchor_root)
+    return _serve_file_bytes(handler, target, mime, disposition, "no-store", csp=csp, anchor_root=anchor_root)
 
 
 def _sse_with_id(handler, event, data, event_id=None):
@@ -10605,7 +13379,7 @@ def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
-    handler.end_headers()
+    end_sse_headers(handler)
     cursor_value = cursor
     try:
         while True:
@@ -10665,7 +13439,7 @@ def _handle_sse_stream(handler, parsed):
         handler.send_header("Cache-Control", "no-cache")
         handler.send_header("X-Accel-Buffering", "no")
         handler.send_header("Connection", "close")
-        handler.end_headers()
+        end_sse_headers(handler)
         try:
             _replay_run_journal(handler, stream_id, _parse_run_journal_after_seq(qs, stream_id))
         except _CLIENT_DISCONNECT_ERRORS:
@@ -10681,7 +13455,7 @@ def _handle_sse_stream(handler, parsed):
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
-    handler.end_headers()
+    end_sse_headers(handler)
     _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
     replay_cutoff_seq = None
     if qs.get("replay", [""])[0] or qs.get("after_seq", [None])[0] not in (None, "") or qs.get("after_event_id", [None])[0]:
@@ -10861,7 +13635,7 @@ def _handle_terminal_output(handler, parsed):
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
-    handler.end_headers()
+    end_sse_headers(handler)
     _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
     try:
         while True:
@@ -10947,7 +13721,7 @@ def _handle_gateway_sse_stream(handler, parsed):
     # connect/sessions_changed snapshot/disconnect that thrashes the
     # session list every ~1s. Letting the server close the socket
     # naturally after the stream ends is sufficient.
-    handler.end_headers()
+    end_sse_headers(handler)
     _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
 
     q = watcher.subscribe()
@@ -10982,7 +13756,7 @@ def _handle_session_events_stream(handler):
     handler.send_header('X-Accel-Buffering', 'no')
     # #3103: see _handle_gateway_sse_stream — `Connection: close` causes
     # EventSource reconnect storms in browsers on long-lived SSE.
-    handler.end_headers()
+    end_sse_headers(handler)
 
     q = subscribe_session_events()
     try:
@@ -11175,6 +13949,7 @@ def _handle_tts(handler, parsed):
     voice = "zh-CN-XiaoxiaoNeural"
     rate_str = ""
     pitch_str = ""
+    engine = "edge"  # "edge" | "elevenlabs" | "browser" (browser is client-side only)
 
     if handler.command != "POST":
         from api.helpers import bad as _bad
@@ -11186,6 +13961,7 @@ def _handle_tts(handler, parsed):
         voice = data.get("voice") or voice
         rate_str = _normalize_tts_prosody(data.get("rate"), unit="%")
         pitch_str = _normalize_tts_prosody(data.get("pitch"), unit="Hz")
+        engine = (data.get("engine") or "edge").strip().lower()
     except Exception:
         from api.helpers import bad as _bad
         return _bad(handler, "invalid request body", 400)
@@ -11258,6 +14034,90 @@ def _handle_tts(handler, parsed):
         from api.helpers import bad as _bad
         return _bad(handler, "rate limit exceeded — please wait", 429)
 
+    # ── ElevenLabs TTS ──────────────────────────────────────────────────
+    if engine == "elevenlabs":
+        api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        if not api_key:
+            # Fall back to reading from Hermes .env file
+            try:
+                from api.onboarding import _load_env_file
+                from api.profiles import get_active_hermes_home
+                api_key = _load_env_file(get_active_hermes_home() / ".env").get("ELEVENLABS_API_KEY", "")
+            except Exception:
+                pass
+        if not api_key:
+            from api.helpers import bad as _bad
+            return _bad(handler, "ELEVENLABS_API_KEY not configured", 503)
+
+        # Resolve voice_id from Hermes config.yaml → env fallback
+        voice_id = "pNInz6obpgDQGcFmaJgB"  # Adam (same default as hermes-agent config.yaml)
+        model_id = "eleven_multilingual_v2"
+        try:
+            from api.config import get_config
+            tts_cfg = (get_config() or {}).get("tts", {})
+            if isinstance(tts_cfg, dict):
+                el_cfg = tts_cfg.get("elevenlabs", {})
+                if isinstance(el_cfg, dict):
+                    voice_id = el_cfg.get("voice_id", voice_id)
+                    model_id = el_cfg.get("model", model_id) or el_cfg.get("model_id", model_id)
+                    # ^ treat empty string as "not set" — fall through to default
+        except Exception:
+            pass  # fall back to defaults
+
+        # Validate voice_id is a safe path segment (no traversal)
+        # fullmatch (not match) so a trailing newline can't slip past the `$`
+        # anchor — defense-in-depth on the config-derived voice_id before it
+        # goes into the request URL (#3510 review).
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', voice_id):
+            from api.helpers import bad as _bad
+            return _bad(handler, "invalid voice_id in config", 400)
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format=mp3_44100_128"
+        req_body = json.dumps({
+            "text": text,
+            "model_id": model_id,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }).encode("utf-8")
+
+        from urllib.request import Request, urlopen as _urlopen
+
+        req = Request(url, data=req_body, headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        })
+
+        # Buffer the full response before sending first byte.
+        # The streaming endpoint is designed for chunked delivery, but urllib's
+        # chunked-read path adds per-chunk overhead that dominates short TTS
+        # payloads. With the 5000-char cap enforced above the buffer is bounded
+        # (a few MB of mp3 worst case), so full-buffer-then-send is faster in
+        # practice and simpler to reason about.
+        audio_data = b""
+        try:
+            with _urlopen(req, timeout=30) as resp:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    audio_data += chunk
+        except Exception:
+            logger.exception("ElevenLabs TTS generation failed")
+            from api.helpers import bad as _bad
+            return _bad(handler, "ElevenLabs TTS generation failed", 500)
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", "audio/mpeg")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Content-Length", str(len(audio_data)))
+        handler.end_headers()
+        try:
+            handler.wfile.write(audio_data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return True
+
+    # ── Edge TTS ────────────────────────────────────────────────────────
     allowed = {
         "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunxiNeural",
         "zh-CN-YunjianNeural", "zh-CN-YunyangNeural",
@@ -11265,6 +14125,7 @@ def _handle_tts(handler, parsed):
         "fr-CA-AntoineNeural", "fr-CA-JeanNeural",
         "fr-CA-SylvieNeural", "fr-CA-ThierryNeural",
         "fr-FR-DeniseNeural", "fr-FR-EloiseNeural", "fr-FR-HenriNeural",
+        "id-ID-GadisNeural",
     }
     if voice not in allowed:
         from api.helpers import bad as _bad
@@ -12037,7 +14898,7 @@ def _handle_approval_sse_stream(handler, parsed):
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
     handler.send_header('Connection', 'close')
-    handler.end_headers()
+    end_sse_headers(handler)
     _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
 
     from api.streaming import _sse
@@ -12139,7 +15000,7 @@ def _handle_clarify_sse_stream(handler, parsed):
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
     handler.send_header('Connection', 'close')
-    handler.end_headers()
+    end_sse_headers(handler)
     _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
 
     from api.streaming import _sse
@@ -12219,7 +15080,7 @@ def _handle_session_sse_stream(handler, parsed):
         # default, matching the other long-lived SSE handlers (gateway/session
         # events) that fixed the reconnect-storm. An explicit value here is a
         # third, inconsistent approach (greptile flag).
-        handler.end_headers()
+        end_sse_headers(handler)
         _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
 
         from api.streaming import _sse
@@ -12251,9 +15112,20 @@ def _handle_session_sse_stream(handler, parsed):
         try:
             recover_stream_id = active_stream_id_for_session(sid)
             if recover_stream_id:
+                pending_started_at = None
+                try:
+                    recover_session = get_session(sid, metadata_only=True)
+                    pending_started_at = getattr(recover_session, "pending_started_at", None)
+                except Exception:
+                    logger.debug(
+                        "session-stream recovery could not read pending_started_at for %s",
+                        sid,
+                        exc_info=True,
+                    )
                 _sse(handler, 'server_turn_started', {
                     "session_id": sid,
                     "stream_id": recover_stream_id,
+                    "pending_started_at": pending_started_at,
                     "source": "subscribe_recovery",
                     "recovered": True,
                 })
@@ -12453,6 +15325,24 @@ def _handle_live_models(handler, parsed):
                     _model_cfg = cfg.get("model", {})
                     _base_url = _model_cfg.get("base_url")
                     _api_key = _model_cfg.get("api_key")
+                # Fallback: try credential pool for base_url + api_key
+                if (not _base_url or not _api_key) and provider.startswith("custom:"):
+                    try:
+                        from api.config import _has_explicit_pool_credentials
+
+                        if _has_explicit_pool_credentials(provider):
+                            from agent.credential_pool import load_pool as _lpool
+                            _resolved = _resolve_provider_alias(provider)
+                            _lm_pool = _lpool(_resolved)
+                            if _lm_pool:
+                                _lm_entry = _lm_pool.select()
+                                if _lm_entry:
+                                    if not _api_key:
+                                        _api_key = getattr(_lm_entry, "runtime_api_key", "") or ""
+                                    if not _base_url:
+                                        _base_url = str(getattr(_lm_entry, "base_url", "") or "").strip()
+                    except ImportError:
+                        pass
                 if _base_url and _api_key:
                     try:
                         import urllib.request
@@ -12519,11 +15409,19 @@ def _handle_live_models(handler, parsed):
                     import urllib.request
                     _providers_cfg = cfg.get("providers", {})
                     _prov = _providers_cfg.get(provider, {}) if isinstance(_providers_cfg, dict) else {}
-                    # Only use provider-scoped key — never fall back to a top-level
-                    # api_key which may belong to a different provider.
+                    # Only use a provider-scoped key.  A top-level model.api_key
+                    # is safe here only when it belongs to the requested provider;
+                    # otherwise /api/models/live?provider=<other> could forward
+                    # the active provider's credential to the wrong third party.
                     _key = _prov.get("api_key") if isinstance(_prov, dict) else None
                     if not _key:
-                        _key = cfg.get("model", {}).get("api_key")
+                        _model_cfg = cfg.get("model", {})
+                        if isinstance(_model_cfg, dict):
+                            _active_provider = _resolve_provider_alias(
+                                (_model_cfg.get("provider") or "").strip().lower()
+                            )
+                            if _active_provider == provider:
+                                _key = _model_cfg.get("api_key")
                     if _key:
                         _req = urllib.request.Request(
                             f"{_ep}/models",
@@ -13277,7 +16175,7 @@ def _handle_background(handler, body):
     return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
 
 
-def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, started_at: float | None) -> None:
+def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, started_at: float | None, source: str = "webui") -> None:
     """Materialize the current user turn for eager first-turn persistence.
 
     The streaming thread still receives ``pending_user_message`` so existing
@@ -13295,6 +16193,8 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
             if latest_text == msg_text:
                 return
     user_msg = {"role": "user", "content": msg}
+    if source and source != "webui":
+        user_msg["_source"] = source
     if isinstance(started_at, (int, float)) and started_at > 0:
         user_msg["timestamp"] = int(started_at)
     if attachments:
@@ -13332,6 +16232,7 @@ def _prepare_chat_start_session_for_stream(
     model_provider,
     stream_id: str,
     started_at: float | None = None,
+    source: str = "webui",
 ):
     """Persist chat-start state according to webui.session_save_mode.
 
@@ -13349,6 +16250,7 @@ def _prepare_chat_start_session_for_stream(
     s.pending_user_message = msg
     s.pending_attachments = attachments
     s.pending_started_at = started_at if started_at is not None else time.time()
+    s.pending_user_source = source
     current_title = getattr(s, "title", None)
     if _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
@@ -13360,6 +16262,7 @@ def _prepare_chat_start_session_for_stream(
             msg,
             attachments,
             s.pending_started_at,
+            source=source,
         )
     s.save()
 
@@ -13435,8 +16338,17 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
     now = time.time()
     try:
         from api import config as _live_config
+        # Snapshot the live-worker set BEFORE taking ACTIVE_RUNS_LOCK (sequential,
+        # not nested, so no lock-ordering/deadlock risk). A long turn whose
+        # active_stream_id was already cleared during final writeback can still be
+        # mid-teardown — its STREAMS entry present — past the age ceiling, so age
+        # alone must NOT pop its lifecycle row (health / background-wakeup /
+        # active-agent-cache consumers read ACTIVE_RUNS as worker-lifecycle truth).
+        with _live_config.STREAMS_LOCK:
+            live_stream_ids = set(_live_config.STREAMS.keys())
+        stale_stream_ids = []
         with _live_config.ACTIVE_RUNS_LOCK:
-            for run_stream_id, raw in (_live_config.ACTIVE_RUNS or {}).items():
+            for run_stream_id, raw in list((_live_config.ACTIVE_RUNS or {}).items()):
                 stream_id = str((raw or {}).get("stream_id") or run_stream_id or "").strip()
                 run_sid = str((raw or {}).get("session_id") or "").strip()
                 if run_sid != sid or not stream_id:
@@ -13445,11 +16357,19 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
                     started_at = float((raw or {}).get("started_at") or 0)
                 except (TypeError, ValueError):
                     started_at = 0.0
-                # Ignore a stale/wedged entry past the unwind ceiling so it can't
-                # block the session permanently.
+                # Past the unwind ceiling: never block a successor on it (the
+                # anti-permanent-409 guarantee, #3822). Additionally reconcile the
+                # zombie out of ACTIVE_RUNS so health/recovery polling stops seeing a
+                # half-alive run — but ONLY when the worker is truly gone from
+                # STREAMS, so a still-live / still-tearing-down worker keeps its
+                # lifecycle row. Pop by the real dict key. (Codex gate, #4492)
                 if started_at and (now - started_at) > ceiling:
+                    if run_stream_id not in live_stream_ids and stream_id not in live_stream_ids:
+                        stale_stream_ids.append(run_stream_id)
                     continue
                 return stream_id
+            for stale_stream_id in stale_stream_ids:
+                (_live_config.ACTIVE_RUNS or {}).pop(stale_stream_id, None)
     except Exception:
         return None
     return None
@@ -13466,6 +16386,7 @@ def _start_chat_stream_for_session(
     normalized_model: bool = False,
     diag=None,
     goal_related: bool = False,
+    source: str = "webui",
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
@@ -13536,6 +16457,7 @@ def _start_chat_stream_for_session(
                     model=model,
                     model_provider=model_provider,
                     stream_id=stream_id,
+                    source=source,
                 )
                 break
         if needs_stale_cleanup:
@@ -13712,6 +16634,7 @@ def _start_run(
                 model_provider=request.provider or model_provider,
                 normalized_model=normalized_model,
                 diag=diag,
+                source=request.source or source,
             )
 
         def _legacy_adapter_factory():
@@ -13750,6 +16673,7 @@ def _start_run(
         model_provider=model_provider,
         normalized_model=normalized_model,
         diag=diag,
+        source=source,
     )
 
 
@@ -13859,6 +16783,7 @@ def start_session_turn(
                     {
                         "session_id": str(session_id),
                         "stream_id": str(stream_id),
+                        "pending_started_at": (resp or {}).get("pending_started_at"),
                         "source": source,
                     },
                 )
@@ -14351,6 +17276,7 @@ def _handle_chat_sync(handler, body):
         _next_context_messages = _dedupe_replayed_context_messages(
             _previous_context_messages,
             _next_context_messages,
+            msg,
         )
         s.context_messages = _next_context_messages
         s.messages = _merge_display_messages_after_agent_result(
@@ -14358,6 +17284,7 @@ def _handle_chat_sync(handler, body):
             _previous_context_messages,
             _restore_display_reasoning_metadata(_previous_messages, _result_messages),
             msg,
+            source=getattr(s, "pending_user_source", None) or "webui",
         )
         # Only auto-generate title when still default; preserves user renames
         if s.title == "Untitled":
@@ -15446,9 +18373,23 @@ def _handle_workspace_add(handler, body):
     # _is_blocked_system_path honours user-tmp carve-outs (e.g. /var/folders on
     # macOS) so pytest's tmp_path_factory paths and other legit user-tmp dirs
     # still register cleanly.
-    candidate = Path(path_str).expanduser().resolve()
+    try:
+        candidate = Path(path_str).expanduser().resolve()
+    except (ValueError, OSError, RuntimeError) as e:
+        # Invalid path (e.g. embedded null byte) — fail closed with a clean 400
+        # instead of letting .resolve() raise an uncaught 500.
+        return bad(handler, f"Invalid path: {_sanitize_error(e)}")
     if _is_blocked_system_path(candidate):
-        return bad(handler, f"Path points to a system directory: {candidate}")
+        # Home-directory carve-out, mirroring the validators
+        # (resolve_trusted_workspace / validate_workspace_to_add): a workspace
+        # at or under the active user's home must stay allowed even when that
+        # home lives under an otherwise-blocked root (e.g. systemd-homed
+        # /var/home/<user>/...). Without this the route rejects valid
+        # /var/home workspaces before validate_workspace_to_add()'s carve-out
+        # can run.
+        _home = _home_path()
+        if not (_home != Path("/") and (candidate == _home or _is_within(candidate, _home))):
+            return bad(handler, f"Path points to a system directory: {candidate}")
     # Now safe to create the directory if requested
     if auto_create:
         try:
@@ -16138,14 +19079,13 @@ def _handle_session_compress(handler, body):
             if _sanitize_messages_for_api(s.messages) != original_messages:
                 return bad(handler, "Session was modified during compression; please retry.", 409)
 
-            s.messages = compressed
-            s.context_messages = compressed
-            s.tool_calls = []
+            s.context_messages = copy.deepcopy(compressed)
             s.active_stream_id = None
             s.pending_user_message = None
             s.pending_attachments = []
             s.pending_started_at = None
-            visible_after = visible_messages_for_anchor(compressed, auto_compression=False)
+            s.pending_user_source = None
+            visible_after = visible_messages_for_anchor(s.messages, auto_compression=False)
             s.compression_anchor_visible_idx = max(0, len(visible_after) - 1) if visible_after else None
             s.compression_anchor_message_key = _anchor_message_key(visible_after[-1]) if visible_after else None
             summary_text = None
@@ -17000,7 +19940,24 @@ def _handle_memory_write(handler, body):
     # (#4217/#4234/#4240).
     if target.is_symlink():
         return bad(handler, "Cannot write to a symlinked memory file")
-    target.write_text(body["content"], encoding="utf-8")
+    try:
+        target.write_text(body["content"], encoding="utf-8")
+    except OSError as exc:
+        if not isinstance(exc, PermissionError) and getattr(exc, "errno", None) != errno.EROFS:
+            raise
+        mode_hint = ""
+        try:
+            mode_hint = f" (mode {target.stat().st_mode & 0o777:o})"
+        except OSError:
+            pass
+        return bad(
+            handler,
+            (
+                f"{target.name} is not writable{mode_hint}: {target}. "
+                "Run chmod 644 on the file or fix ownership on the shared volume."
+            ),
+            403,
+        )
     return j(handler, {"ok": True, "section": section, "path": str(target)})
 
 
@@ -17093,6 +20050,8 @@ def _handle_session_import_cli(handler, body):
     if requested_profile == "":
         return bad(handler, "invalid profile", 400)
     allow_all_profiles = _request_wants_all_profiles_import(body)
+    if allow_all_profiles and _is_isolated_profile_mode():
+        return bad(handler, "all_profiles import is not allowed in isolated profile mode", 403)
     if allow_all_profiles and not requested_profile:
         return bad(handler, "profile is required for all_profiles import", 400)
 
@@ -17301,6 +20260,7 @@ def _handle_session_import(handler, body):
         model=model,
         messages=messages,
         tool_calls=body.get("tool_calls", []),
+        profile=get_active_profile_name(),
     )
     s.pinned = body.get("pinned", False)
     with LOCK:

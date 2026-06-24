@@ -394,8 +394,13 @@ def test_fade_text_effect_uses_dynamic_window_check():
     assert "return _streamFadeEnabledForStream;" not in helper_block
 
     # The preferences listener must update the runtime flag immediately, not
-    # only after autosave/save completes.
-    fade_cb_start = PANELS_JS.index("const fadeTextCb=$('settingsFadeTextEffect');", 300000)
+    # only after autosave/save completes. Anchor on the listener occurrence —
+    # the one immediately followed by the terminalAutoExpand field — rather than
+    # a fragile byte offset (panels.js has two `fadeTextCb=` references: the
+    # settings-body payload builder and this listener block).
+    fade_cb_start = PANELS_JS.index(
+        "const fadeTextCb=$('settingsFadeTextEffect');\n    if(fadeTextCb){"
+    )
     fade_cb_end = PANELS_JS.index("const terminalAutoExpandCb", fade_cb_start)
     fade_cb_block = PANELS_JS[fade_cb_start:fade_cb_end]
     assert "window._fadeTextEffect=fadeTextCb.checked" in fade_cb_block
@@ -415,7 +420,7 @@ def test_thinking_blocks_persist_after_renderMessages():
     assert inner_sweep in UI_JS
     # The promoted-row guard is the only thing that changed; the rest of
     # the selector must remain intact.
-    head = ".tool-worklog-group:not([data-compression-card]),.tool-call-group:not([data-compression-card]),.tool-card-row:not([data-compression-card]),.agent-activity-thinking"
+    head = ".tool-worklog-group:not([data-compression-card]),.tool-call-group:not([data-compression-card]),.tool-card-row:not([data-compression-card]):not([data-event-type=\"tool\"]),.agent-activity-thinking"
     tail = ".wl-reason[data-worklog-reason-source=\"reasoning\"]"
     assert head in UI_JS
     assert tail in UI_JS
