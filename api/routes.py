@@ -10218,7 +10218,13 @@ def handle_get(handler, parsed) -> bool:
     # os.environ (process-global) at call time. Wrap in cron_profile_context
     # so the TLS-active profile's jobs.json is read, not the process default.
     if parsed.path == "/api/crons":
-        from cron.jobs import list_jobs
+        # #4768: in split-container / minimal Docker deployments the WebUI image may
+        # not ship the agent's `cron` package on its import path. Degrade gracefully
+        # (empty list + cron_unavailable flag) instead of 500ing the whole Task tab.
+        try:
+            from cron.jobs import list_jobs
+        except ModuleNotFoundError:
+            return j(handler, {"jobs": [], "cron_unavailable": True})
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
