@@ -5108,20 +5108,7 @@ def _session_lacks_final_assistant_answer(messages) -> bool:
 
 def _merged_transcript_lacks_final_assistant_answer(previous_display, previous_context, result_messages, msg_text, source: str = "webui") -> bool:
     """Return True when the current turn still lacks a final assistant answer."""
-    result_messages = list(result_messages or [])
-    previous_context = list(previous_context or [])
-    current_user_idx = _find_current_user_turn(result_messages, msg_text)
-
-    if _messages_have_prefix(result_messages, previous_context):
-        candidates = result_messages[len(previous_context):]
-    elif current_user_idx is not None:
-        candidates = result_messages[current_user_idx + 1:]
-    else:
-        candidates = result_messages
-
-    if _session_lacks_final_assistant_answer(candidates):
-        return True
-
+    previous_display = list(previous_display or [])
     merged_messages = _merge_display_messages_after_agent_result(
         previous_display,
         previous_context,
@@ -5129,7 +5116,42 @@ def _merged_transcript_lacks_final_assistant_answer(previous_display, previous_c
         msg_text,
         source=source,
     )
-    return _session_lacks_final_assistant_answer(merged_messages)
+    current_user_idx = _find_current_user_turn(merged_messages, msg_text)
+    if current_user_idx is None or current_user_idx < len(previous_display):
+        # The active turn lives after the durable transcript boundary. If the
+        # merged display only exposes an older user row, materialize the pending
+        # prompt so a replayed assistant row cannot satisfy the wrong turn.
+        pending_user = {
+            'role': 'user',
+            'content': msg_text,
+        }
+        if source and source != 'webui':
+            pending_user['_source'] = source
+        merged_messages.append(pending_user)
+        current_user_idx = len(merged_messages) - 1
+
+    current_user_key = _message_identity(merged_messages[current_user_idx])
+    prior_id_set = {
+        _message_identity(msg)
+        for msg in merged_messages[:current_user_idx]
+        if isinstance(msg, dict)
+    }
+    filtered_messages = merged_messages[:current_user_idx + 1]
+    for msg in merged_messages[current_user_idx + 1:]:
+        if not isinstance(msg, dict):
+            filtered_messages.append(msg)
+            continue
+        if msg.get('role') == 'assistant':
+            key = _message_identity(msg)
+            if key is not None and key in prior_id_set:
+                continue
+        filtered_messages.append(msg)
+    if current_user_key is not None:
+        filtered_messages = [
+            msg for msg in filtered_messages
+            if _message_identity(msg) != current_user_key or msg is merged_messages[current_user_idx]
+        ]
+    return _session_lacks_final_assistant_answer(filtered_messages)
 
 
 def _agent_result_terminal_failure(result) -> bool:

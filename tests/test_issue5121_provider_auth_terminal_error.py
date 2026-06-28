@@ -259,6 +259,36 @@ def test_auth_401_seeded_multi_turn_partial_persists_error_turn(tmp_path, monkey
     assert not any(event == "done" for event, _ in events)
 
 
+def test_auth_401_seeded_replayed_assistant_does_not_satisfy_current_turn(tmp_path, monkeypatch):
+    session = _prepare_session("auth_seeded_replay", "stream_auth_seeded_replay", pending_user_message="Please respond now")
+    _seed_prior_turn(
+        session,
+        prior_user="Earlier question",
+        prior_assistant="Earlier answer",
+    )
+
+    class ReplayAssistantAuthFailureAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "messages": history + [{"role": "assistant", "content": "Earlier answer"}],
+                "error": _auth_failure_error_payload(),
+            }
+
+    fake_queue = _run_stream(monkeypatch, session, "stream_auth_seeded_replay", ReplayAssistantAuthFailureAgent, workspace=str(tmp_path))
+    saved = Session.load("auth_seeded_replay")
+    assert saved is not None
+
+    assert any(msg.get("role") == "user" and msg.get("content") == "Please respond now" for msg in saved.messages)
+    assert saved.messages[-1]["_error"] is True
+    assert saved.messages[-1]["role"] == "assistant"
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors and apperrors[-1]["type"] == "auth_mismatch"
+    assert not any(event == "done" for event, _ in events)
+
+
 def test_auth_retry_success_does_not_append_error_turn(tmp_path, monkeypatch):
     session = _prepare_session("auth_retry", "stream_auth_retry", pending_user_message="Please retry")
     agent_cls = _build_auth_failure_agent(token_text="")
@@ -375,5 +405,35 @@ def test_non_auth_seeded_multi_turn_partial_persists_error_turn(tmp_path, monkey
     events = _queue_events(fake_queue)
     apperrors = [data for event, data in events if event == "apperror"]
     assert apperrors, "expected apperror for seeded partial silent failure"
+    assert apperrors[-1]["type"] == "no_response"
+    assert not any(event == "done" for event, _ in events)
+
+
+def test_non_auth_seeded_replayed_assistant_does_not_satisfy_current_turn(tmp_path, monkeypatch):
+    session = _prepare_session("seeded_replay_escape", "stream_seeded_replay_escape", pending_user_message="Please handle this now")
+    _seed_prior_turn(
+        session,
+        prior_user="Earlier question",
+        prior_assistant="Earlier answer",
+    )
+
+    class ReplayAssistantSilentFailureAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "messages": history + [{"role": "assistant", "content": "Earlier answer"}],
+                "error": "",
+            }
+
+    fake_queue = _run_stream(monkeypatch, session, "stream_seeded_replay_escape", ReplayAssistantSilentFailureAgent, workspace=str(tmp_path))
+    saved = Session.load("seeded_replay_escape")
+    assert saved is not None
+
+    assert any(msg.get("role") == "user" and msg.get("content") == "Please handle this now" for msg in saved.messages)
+    assert saved.messages[-1]["_error"] is True
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for seeded replay silent failure"
     assert apperrors[-1]["type"] == "no_response"
     assert not any(event == "done" for event, _ in events)
