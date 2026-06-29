@@ -12,6 +12,7 @@ const ICONS={
   edit:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2z"/><path d="M10 4l2 2"/></svg>',
   spark:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8l1.1 3.1 3.1 1.1-3.1 1.1L8 10.2 6.9 7.1 3.8 6l3.1-1.1z"/><path d="M12.5 9.5l.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5-1.5-.5 1.5-.5z"/></svg>',
   link:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6.7 9.3a3 3 0 0 1 0-4.2l1.7-1.7a3 3 0 0 1 4.2 4.2l-1 1"/><path d="M9.3 6.7a3 3 0 0 1 0 4.2l-1.7 1.7a3 3 0 0 1-4.2-4.2l1-1"/></svg>',
+  download:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 10.5v3h-13v-3"/><polyline points="4.5 6.8 8 10.3 11.5 6.8"/><line x1="8" y1="10.3" x2="8" y2="1.5"/></svg>',
 };
 
 // Tracks which session_id is currently being loaded. Used to discard stale
@@ -3673,6 +3674,16 @@ function _openSessionActionMenu(session, anchorEl){
   if(!isExternalSession){
     _appendSessionDuplicateAction(menu, session);
   }
+  // Export session — right-click menu item (#3223 design compatibility)
+  menu.appendChild(_buildSessionAction(
+    t('session_export'),
+    t('session_export_desc'),
+    ICONS.download,
+    async()=>{
+      closeSessionActionMenu();
+      _showSessionExportPicker(session);
+    }
+  ));
   if(session.active_stream_id){
     menu.appendChild(_buildSessionAction(
       t('session_stop_response'),
@@ -7678,3 +7689,72 @@ document.addEventListener('keydown',(e)=>{
   e.preventDefault();
   navigateSession(e.key==='j'?1:-1);
 });
+
+// ── Session Export ──
+function _showSessionExportPicker(session){
+  const sid = session && session.session_id;
+  if(!sid) return;
+  // Build a small modal with format choices
+  const overlay = document.createElement('div');
+  overlay.className = 'session-export-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:10001;display:flex;align-items:center;justify-content:center;';
+  overlay.onclick = (e) => { if(e.target === overlay) overlay.remove(); };
+
+  const box = document.createElement('div');
+  box.className = 'session-export-box';
+  box.style.cssText = 'background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:360px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+  box.onclick = (e) => e.stopPropagation();
+
+  const title = document.createElement('h3');
+  title.style.cssText = 'margin:0 0 16px;font-size:16px;color:var(--text);';
+  title.textContent = t('session_export') || 'Export Session';
+  box.appendChild(title);
+
+  const desc = document.createElement('p');
+  desc.style.cssText = 'margin:0 0 16px;font-size:13px;color:var(--muted);';
+  desc.textContent = t('session_export_desc') || 'Download this conversation as a file.';
+  box.appendChild(desc);
+
+  const formats = [
+    {fmt:'md', label:'Markdown (.md)', icon:'📝', desc:t('session_export_md_desc')||'GitHub-friendly, readable text'},
+    {fmt:'html', label:'HTML (.html)', icon:'🌐', desc:t('session_export_html_desc')||'Self-contained page, view in browser'},
+    {fmt:'json', label:'JSON (.json)', icon:'📦', desc:t('session_export_json_desc')||'Full data export, machine-readable'},
+  ];
+
+  formats.forEach(({fmt, label, icon, desc: fmtDesc}) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.style.cssText = 'display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;margin-bottom:8px;border:1px solid var(--border);border-radius:8px;background:var(--code-bg);color:var(--text);cursor:pointer;font-size:13px;text-align:left;';
+    btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; };
+    btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; };
+    btn.innerHTML = `<span style="font-size:18px">${icon}</span><div><strong>${esc(label)}</strong><br><span style="font-size:11px;color:var(--muted)">${esc(fmtDesc)}</span></div>`;
+    btn.onclick = () => {
+      overlay.remove();
+      _downloadSessionExport(sid, fmt);
+    };
+    box.appendChild(btn);
+  });
+
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.style.cssText = 'display:block;width:100%;padding:8px;margin-top:8px;border:none;background:transparent;color:var(--muted);cursor:pointer;font-size:13px;';
+  cancel.textContent = t('cancel') || 'Cancel';
+  cancel.onclick = () => overlay.remove();
+  box.appendChild(cancel);
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
+function _downloadSessionExport(sid, fmt){
+  const url = `/api/session/export?session_id=${encodeURIComponent(sid)}&format=${fmt}`;
+  // Use a temporary anchor to trigger download
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 100);
+  showToast(t('session_export_started') || 'Export started…');
+}

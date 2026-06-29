@@ -12917,10 +12917,207 @@ def _serve_static(handler, parsed):
     return True
 
 
+def _session_message_text(message):
+    """Extract plain text from a session message, combining content blocks."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def _session_export_markdown(session_dict, sid, title):
+    """Render a session as redacted Markdown."""
+    from html import escape as _he
+    lines = []
+    safe_title = title or sid[:12]
+    lines.append(f"# {safe_title}")
+    lines.append(f"")
+    lines.append(f"> **Session ID:** `{sid}`  ")
+    lines.append(f"> **Messages:** {len(session_dict.get('messages', []))}  ")
+    if session_dict.get("model"):
+        lines.append(f"> **Model:** {session_dict['model']}  ")
+    ts = session_dict.get("created_at") or session_dict.get("started_at")
+    if ts:
+        lines.append(f"> **Time:** {ts}")
+    lines.append(f"")
+    lines.append("---")
+    lines.append("")
+
+    messages = session_dict.get("messages", [])
+    if not isinstance(messages, list):
+        return "\n".join(lines)
+
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).strip().lower()
+        text = _session_message_text(msg).strip()
+        if not text:
+            # Check for tool_calls
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                text = "🔧 *Tool calls:* " + ", ".join(
+                    tc.get("function", {}).get("name", "?") if isinstance(tc, dict) else "?"
+                    for tc in tool_calls
+                )
+
+        if not text:
+            continue
+
+        if role == "user":
+            prefix = "👤 **You**"
+        elif role == "assistant":
+            prefix = "🤖 **Assistant**"
+        elif role == "tool":
+            prefix = "🔧 **Tool Result**"
+        else:
+            prefix = f"**{role.title()}**"
+
+        text = _redact_text(text)
+        lines.append(f"{prefix}:")
+        lines.append("")
+        for paragraph in text.split("\n"):
+            lines.append(f"> {paragraph}")
+        lines.append("")
+
+        # Add tool_calls after assistant message
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                for tc in tool_calls:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    fn_name = fn.get("name", "unknown")
+                    fn_args = fn.get("arguments", "")
+                    if isinstance(fn_args, str) and len(fn_args) > 200:
+                        fn_args = fn_args[:200] + "..."
+                    lines.append(f"  🔧 `{fn_name}`")
+                    if fn_args:
+                        lines.append(f"     ```json")
+                        lines.append(f"     {fn_args}")
+                        lines.append(f"     ```")
+                    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _session_export_html(session_dict, sid, title):
+    """Render a session as a self-contained HTML page."""
+    from html import escape as _he
+    safe_title = _he(title or sid[:12])
+
+    parts = []
+    parts.append("<!DOCTYPE html>")
+    parts.append('<html lang="en">')
+    parts.append("<head>")
+    parts.append('<meta charset="utf-8">')
+    parts.append('<meta name="viewport" content="width=device-width, initial-scale=1">')
+    parts.append(f"<title>{safe_title} — Hermes Session Export</title>")
+    parts.append("<style>")
+    parts.append("""
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+           max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6;
+           background: #fafafa; color: #1a1a1a; }
+    @media (prefers-color-scheme: dark) { body { background: #1a1a1a; color: #e0e0e0; } }
+    h1 { border-bottom: 2px solid #e0e0e0; padding-bottom: 8px; }
+    .meta { color: #666; font-size: 0.9em; margin-bottom: 24px; }
+    @media (prefers-color-scheme: dark) { .meta { color: #999; } }
+    .msg { margin: 16px 0; padding: 12px 16px; border-radius: 12px; }
+    .user { background: #e3f2fd; }
+    .assistant { background: #f3e5f5; }
+    .tool { background: #fff3e0; font-size: 0.85em; }
+    @media (prefers-color-scheme: dark) {
+      .user { background: #1a3a5c; }
+      .assistant { background: #3a1a4a; }
+      .tool { background: #4a3a1a; }
+    }
+    .role { font-weight: 700; font-size: 0.85em; text-transform: uppercase; margin-bottom: 4px; }
+    .user .role { color: #1565c0; }
+    .assistant .role { color: #7b1fa2; }
+    @media (prefers-color-scheme: dark) {
+      .user .role { color: #64b5f6; }
+      .assistant .role { color: #ce93d8; }
+    }
+    .content { white-space: pre-wrap; word-break: break-word; }
+    .tool-call { font-family: monospace; font-size: 0.8em; background: rgba(0,0,0,0.06);
+                 padding: 4px 8px; border-radius: 6px; margin-top: 4px; display: inline-block; }
+    .divider { border: none; border-top: 1px solid #e0e0e0; margin: 0; }
+""".strip())
+    parts.append("</style>")
+    parts.append("</head>")
+    parts.append("<body>")
+    parts.append(f"<h1>{safe_title}</h1>")
+    parts.append('<div class="meta">')
+    parts.append(f"<strong>Session ID:</strong> <code>{_he(sid)}</code><br>")
+    parts.append(f"<strong>Messages:</strong> {len(session_dict.get('messages', []))}<br>")
+    if session_dict.get("model"):
+        parts.append(f"<strong>Model:</strong> {_he(session_dict['model'])}<br>")
+    ts = session_dict.get("created_at") or session_dict.get("started_at")
+    if ts:
+        parts.append(f"<strong>Time:</strong> {_he(str(ts))}")
+    parts.append("</div>")
+
+    messages = session_dict.get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).strip().lower()
+        text = _redact_text(_session_message_text(msg)).strip()
+        if not text:
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                text = "Tool calls: " + ", ".join(
+                    tc.get("function", {}).get("name", "?") if isinstance(tc, dict) else "?"
+                    for tc in tool_calls
+                )
+
+        if not text:
+            continue
+
+        css_class = role if role in ("user", "assistant") else "tool"
+        role_label = {"user": "👤 You", "assistant": "🤖 Assistant", "tool": "🔧 Tool"}.get(role, role.title())
+
+        parts.append(f'<div class="msg {css_class}">')
+        parts.append(f'<div class="role">{role_label}</div>')
+        parts.append(f'<div class="content">{_he(text)}</div>')
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    fn_name = fn.get("name", "unknown")
+                    parts.append(f'<div class="tool-call">🔧 {_he(fn_name)}</div>')
+
+        parts.append("</div>")
+
+    parts.append('<hr class="divider">')
+    parts.append(f'<div class="meta" style="text-align:center;font-size:0.8em">Exported from Hermes WebUI</div>')
+    parts.append("</body>")
+    parts.append("</html>")
+
+    return "\n".join(parts)
+
+
 def _handle_session_export(handler, parsed):
     sid = parse_qs(parsed.query).get("session_id", [""])[0]
     if not sid:
         return bad(handler, "session_id is required")
+    fmt = (parse_qs(parsed.query).get("format", ["json"])[0] or "json").strip().lower()
+    if fmt not in ("json", "md", "markdown", "html"):
+        return bad(handler, "format must be json, md, or html")
+
     try:
         s = get_session(sid)
     except KeyError:
@@ -12928,17 +13125,35 @@ def _handle_session_export(handler, parsed):
     active_profile = get_active_profile_name()
     if not _profiles_match(getattr(s, "profile", None), active_profile):
         return bad(handler, "Session not found", 404)
+
     safe = redact_session_data(s.__dict__)
-    payload = json.dumps(safe, ensure_ascii=False, indent=2)
+    title = str(safe.get("title", "") or "").strip() or sid[:12]
+
+    if fmt == "json":
+        payload = json.dumps(safe, ensure_ascii=False, indent=2)
+        content_type = "application/json; charset=utf-8"
+        ext = "json"
+        body = payload.encode("utf-8")
+    elif fmt in ("md", "markdown"):
+        payload = _session_export_markdown(safe, sid, title)
+        content_type = "text/markdown; charset=utf-8"
+        ext = "md"
+        body = payload.encode("utf-8")
+    else:  # html
+        payload = _session_export_html(safe, sid, title)
+        content_type = "text/html; charset=utf-8"
+        ext = "html"
+        body = payload.encode("utf-8")
+
     handler.send_response(200)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Type", content_type)
     handler.send_header(
-        "Content-Disposition", f'attachment; filename="hermes-{sid}.json"'
+        "Content-Disposition", f'attachment; filename="hermes-{sid}.{ext}"'
     )
-    handler.send_header("Content-Length", str(len(payload.encode("utf-8"))))
+    handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
-    handler.wfile.write(payload.encode("utf-8"))
+    handler.wfile.write(body)
     return True
 
 
