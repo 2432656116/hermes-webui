@@ -10910,3 +10910,52 @@ function updateNotificationPermissionStatus(){
   }
   if(btnWrap) btnWrap.title=label;
 }
+
+// ── Health Diagnostics ──
+function runDiagnostics(){
+  const btn = $('btnRunDiagnostics');
+  const results = $('diagResults');
+  if(!results) return;
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+  results.innerHTML = '<div style="color:var(--muted);padding:8px 0">'+esc(t('diag_running')||'Running diagnostics…')+'</div>';
+
+  api('/api/health/diagnostics').then(d=>{
+    if(!d || !Array.isArray(d.checks)){
+      results.innerHTML = '<div style="color:#ef4444;padding:8px 0">'+esc(t('diag_failed')||'Diagnostics failed')+'</div>';
+      btn.disabled = false;
+      btn.textContent = t('diag_run')||'Run Diagnostics';
+      return;
+    }
+
+    const overallIcon = {healthy:'✅',degraded:'⚠️',critical:'❌'}[d.overall]||'❓';
+    const overallLabel = {healthy:t('diag_healthy')||'All systems healthy',degraded:t('diag_degraded')||'Some issues detected',critical:t('diag_critical')||'Critical failures'}[d.overall]||d.overall;
+
+    let html = '<div style="font-size:14px;font-weight:600;margin-bottom:10px;padding:8px 12px;border-radius:8px;'+
+      (d.overall==='healthy'?'background:rgba(34,197,94,.12);color:#4ade80;':'')+
+      (d.overall==='degraded'?'background:rgba(245,158,11,.12);color:#f59e0b;':'')+
+      (d.overall==='critical'?'background:rgba(239,68,68,.12);color:#f87171;':'')+
+      '">'+overallIcon+' '+esc(overallLabel)+' <span style="font-weight:400;font-size:11px">('+d.passed+'/'+d.total+' passed)</span></div>';
+
+    d.checks.forEach(c=>{
+      const icon = c.status==='pass'?'✅':'❌';
+      html += '<div style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;margin-bottom:4px;border:1px solid var(--border);border-radius:6px;background:var(--surface);font-size:12px">';
+      html += '<span style="flex-shrink:0;padding-top:1px">'+icon+'</span>';
+      html += '<div style="min-width:0">';
+      html += '<div style="font-weight:600;color:var(--text)">'+esc(c.label)+'</div>';
+      html += '<div style="color:var(--muted);font-size:11px;word-break:break-word">'+esc(c.detail||'')+'</div>';
+      if(c.fix){
+        html += '<div style="color:#60a5fa;font-size:11px;margin-top:2px">💡 '+esc(c.fix)+'</div>';
+      }
+      html += '</div></div>';
+    });
+
+    results.innerHTML = html;
+    btn.disabled = false;
+    btn.textContent = t('diag_refresh')||'Refresh';
+  }).catch(e=>{
+    results.innerHTML = '<div style="color:#ef4444;padding:8px 0">'+esc(t('diag_failed')||'Diagnostics failed')+': '+esc(e.message||'network error')+'</div>';
+    btn.disabled = false;
+    btn.textContent = t('diag_run')||'Run Diagnostics';
+  });
+}

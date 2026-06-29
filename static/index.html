@@ -1536,6 +1536,13 @@
               <div id="mcpToolPager" class="mcp-tool-pager" aria-label="MCP tools pagination" data-i18n-aria-label="mcp_tools_pagination_label"></div>
               <div class="mcp-restart-hint" data-i18n="mcp_tools_runtime_note">Tool inventory only uses already-known active MCP runtime data; the WebUI does not start or probe servers.</div>
             </div>
+            <!-- Health Diagnostics Section -->
+            <div class="settings-field" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
+              <label data-i18n="diag_title">Health Diagnostics</label>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:8px" data-i18n="diag_desc">Run a battery of checks on your Hermes installation.</div>
+              <button class="sm-btn" id="btnRunDiagnostics" onclick="runDiagnostics()" style="width:100%;padding:8px;font-weight:600" data-i18n="diag_run">Run Diagnostics</button>
+              <div id="diagResults" style="margin-top:10px;font-size:12px" aria-live="polite"></div>
+            </div>
             <button class="sm-btn" onclick="saveSettings()" style="margin-top:12px;width:100%;padding:8px;font-weight:600" data-i18n="settings_save_btn">Save Settings</button>
           </div>
           <div class="settings-pane" id="settingsPaneHelp">

@@ -9121,6 +9121,9 @@ def handle_get(handler, parsed) -> bool:
         j(handler, build_system_health_payload())
         return True
 
+    if parsed.path == "/api/health/diagnostics":
+        return _handle_health_diagnostics(handler)
+
     if parsed.path == "/api/models":
         # Profile-scoping for non-default profiles (#3957) is handled INSIDE
         # get_available_models() — it binds the active profile's env + TLS on
@@ -21510,3 +21513,154 @@ def _handle_mcp_server_update(handler, name, body):
     _save_yaml_config_file(_get_config_path(), cfg)
     reload_config()
     return j(handler, {"ok": True, "server": _server_summary(name, server_cfg)})
+
+
+# ── Health Diagnostics ───────────────────────────────────────────────────────
+
+def _diagnostics_check(label: str, ok: bool, detail: str = "", fix: str = "") -> dict:
+    """Build a single diagnostic check result."""
+    return {
+        "label": label,
+        "status": "pass" if ok else "fail",
+        "detail": detail,
+        "fix": fix,
+    }
+
+
+def _run_diagnostics() -> dict:
+    """Run a battery of health checks on the Hermes installation."""
+    import os, subprocess, shutil, sqlite3
+    checks = []
+
+    # Pre-load config once
+    try:
+        from api.config import get_config
+        cfg = get_config()
+    except Exception:
+        cfg = {}
+
+    # 1. Hermes CLI
+    try:
+        r = subprocess.run(["hermes", "--version"], capture_output=True, text=True, timeout=10)
+        version = (r.stdout or "").strip() or (r.stderr or "").strip()
+        if version and r.returncode == 0:
+            checks.append(_diagnostics_check("Hermes CLI", True, version))
+        else:
+            checks.append(_diagnostics_check("Hermes CLI", False, "CLI returned error",
+                "Run: curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"))
+    except FileNotFoundError:
+        checks.append(_diagnostics_check("Hermes CLI", False, "hermes not found in PATH",
+            "Install Hermes Agent or add it to PATH"))
+    except Exception as e:
+        checks.append(_diagnostics_check("Hermes CLI", False, str(e)))
+
+    # 2. State DB
+    try:
+        from api.webui_session_db import get_webui_db_path
+        db_path = get_webui_db_path()
+        if db_path and db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            try:
+                cur = conn.execute("SELECT sqlite_version()")
+                db_ver = cur.fetchone()[0]
+                checks.append(_diagnostics_check("State DB", True,
+                    f"SQLite {db_ver} at {db_path}"))
+            finally:
+                conn.close()
+        else:
+            checks.append(_diagnostics_check("State DB", False, "No state.db found",
+                "Set HERMES_WEBUI_SQLITE=1 and restart"))
+    except Exception as e:
+        checks.append(_diagnostics_check("State DB", False, str(e)))
+
+    # 3. API / Model
+    try:
+        provider = cfg.get("model", {}).get("provider", "auto")
+        model = cfg.get("model", {}).get("default", "not set")
+        checks.append(_diagnostics_check("Model Config", model != "not set",
+            f"provider={provider}, model={model}" if model != "not set" else "No model configured",
+            "Run: hermes model to select a model"))
+    except Exception as e:
+        checks.append(_diagnostics_check("Model Config", False, str(e)))
+
+    # 4. MCP Servers
+    try:
+        servers = cfg.get("mcp_servers", {}) if isinstance(cfg, dict) else {}
+        if servers:
+            enabled = sum(1 for s in servers.values() if isinstance(s, dict) and s.get("enabled", True) is not False)
+            checks.append(_diagnostics_check("MCP Servers", True,
+                f"{enabled}/{len(servers)} enabled"))
+        else:
+            checks.append(_diagnostics_check("MCP Servers", True, "No MCP servers configured",
+                "Run: hermes mcp add to add servers"))
+    except Exception as e:
+        checks.append(_diagnostics_check("MCP Servers", False, str(e)))
+
+    # 5. Agent Bridge
+    try:
+        from api.config import AGENT_BRIDGE_ENABLED, AGENT_BRIDGE_SOCKET
+        if AGENT_BRIDGE_ENABLED:
+            if os.path.exists(AGENT_BRIDGE_SOCKET):
+                checks.append(_diagnostics_check("Agent Bridge", True,
+                    f"Socket: {AGENT_BRIDGE_SOCKET}"))
+            else:
+                checks.append(_diagnostics_check("Agent Bridge", False,
+                    f"Socket missing: {AGENT_BRIDGE_SOCKET}",
+                    "Start the bridge: python api/agent_bridge.py &"))
+        else:
+            checks.append(_diagnostics_check("Agent Bridge", True,
+                "Not enabled (in-process mode)"))
+    except Exception as e:
+        checks.append(_diagnostics_check("Agent Bridge", False, str(e)))
+
+    # 6. Gateway
+    try:
+        # Try to detect gateway platforms from env/config
+        connected = []
+        platform_env = {
+            "telegram": "HERMES_TELEGRAM_TOKEN",
+            "discord": "HERMES_DISCORD_TOKEN",
+            "weixin": "HERMES_WEIXIN_TOKEN",
+            "qqbot": "HERMES_QQBOT_TOKEN",
+        }
+        for name, env_var in platform_env.items():
+            if os.getenv(env_var):
+                connected.append(name)
+        if connected:
+            checks.append(_diagnostics_check("Gateway", True,
+                f"{len(connected)} platforms configured: {', '.join(connected)}"))
+        else:
+            checks.append(_diagnostics_check("Gateway", True, "No gateway platforms configured"))
+    except Exception as e:
+        checks.append(_diagnostics_check("Gateway", False, str(e)))
+
+    # 7. Disk space (hermes dirs)
+    try:
+        hermes_home = os.path.expanduser("~/.hermes")
+        if os.path.exists(hermes_home):
+            usage = shutil.disk_usage(hermes_home)
+            free_gb = usage.free / (1024**3)
+            checks.append(_diagnostics_check("Disk Space", free_gb > 1,
+                f"{free_gb:.1f} GB free on {hermes_home}",
+                "Clean up old sessions: hermes sessions prune"))
+        else:
+            checks.append(_diagnostics_check("Disk Space", True, "~/.hermes not found yet"))
+    except Exception as e:
+        checks.append(_diagnostics_check("Disk Space", False, str(e)))
+
+    # Summary
+    passed = sum(1 for c in checks if c["status"] == "pass")
+    failed = sum(1 for c in checks if c["status"] == "fail")
+    overall = "healthy" if failed == 0 else "degraded" if passed > 0 else "critical"
+
+    return {
+        "overall": overall,
+        "passed": passed,
+        "failed": failed,
+        "total": len(checks),
+        "checks": checks,
+    }
+
+
+def _handle_health_diagnostics(handler):
+    return j(handler, _run_diagnostics())

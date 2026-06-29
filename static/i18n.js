@@ -130,6 +130,18 @@ const LOCALES = {
     mcp_tools_previous_page_aria: 'Previous MCP tools page',
     mcp_tools_next_page: 'Next ›',
     mcp_tools_next_page_aria: 'Next MCP tools page',
+
+    // Health diagnostics
+    diag_title: 'Health Diagnostics',
+    diag_desc: 'Run a battery of checks on your Hermes installation.',
+    diag_run: 'Run Diagnostics',
+    diag_refresh: 'Refresh',
+    diag_running: 'Running diagnostics…',
+    diag_failed: 'Diagnostics failed',
+    diag_healthy: 'All systems healthy',
+    diag_degraded: 'Some issues detected',
+    diag_critical: 'Critical failures detected',
+
     // PDF preview (#480)
     pdf_loading: 'Loading PDF {0}…',
     pdf_too_large: 'PDF too large for inline preview',
@@ -1801,6 +1813,18 @@ const LOCALES = {
     mcp_tools_previous_page_aria: 'Previous MCP tools page',
     mcp_tools_next_page: 'Next ›',
     mcp_tools_next_page_aria: 'Next MCP tools page',
+
+    // Health diagnostics
+    diag_title: 'Health Diagnostics',
+    diag_desc: 'Run a battery of checks on your Hermes installation.',
+    diag_run: 'Run Diagnostics',
+    diag_refresh: 'Refresh',
+    diag_running: 'Running diagnostics…',
+    diag_failed: 'Diagnostics failed',
+    diag_healthy: 'All systems healthy',
+    diag_degraded: 'Some issues detected',
+    diag_critical: 'Critical failures detected',
+
     // PDF preview (#480)
     pdf_loading: 'Caricamento PDF {0}…',
     pdf_too_large: "PDF troppo grande per l'anteprima inline",
@@ -9747,6 +9771,17 @@ const LOCALES = {
     mcp_tools_previous_page_aria: '上一页 MCP 工具',
     mcp_tools_next_page: '下一页 ›',
     mcp_tools_next_page_aria: '下一页 MCP 工具',
+
+    diag_title: '健康诊断',
+    diag_desc: '对 Hermes 安装进行一系列检查。',
+    diag_run: '运行诊断',
+    diag_refresh: '刷新',
+    diag_running: '正在运行诊断…',
+    diag_failed: '诊断失败',
+    diag_healthy: '所有系统正常',
+    diag_degraded: '检测到部分问题',
+    diag_critical: '检测到严重故障',
+
     thinking: '思考过程',
     expand_all: '全部展开',
     collapse_all: '全部折叠',
@@ -11356,6 +11391,17 @@ const LOCALES = {
     mcp_tools_previous_page_aria: '上一頁 MCP 工具',
     mcp_tools_next_page: '下一頁 ›',
     mcp_tools_next_page_aria: '下一頁 MCP 工具',
+
+    diag_title: '健康診斷',
+    diag_desc: '對 Hermes 安裝進行一系列檢查。',
+    diag_run: '執行診斷',
+    diag_refresh: '重新整理',
+    diag_running: '正在執行診斷…',
+    diag_failed: '診斷失敗',
+    diag_healthy: '所有系統正常',
+    diag_degraded: '偵測到部分問題',
+    diag_critical: '偵測到嚴重故障',
+
     // PDF preview (#480)
     pdf_loading: '正在載入 PDF {0}…',
     pdf_too_large: 'PDF 太大，無法直接預覽',
