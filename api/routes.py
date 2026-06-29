@@ -12728,6 +12728,11 @@ def handle_post(handler, parsed) -> bool:
         handler.wfile.write(body)
         return True
 
+    # ── MCP Server Test (POST) ──
+    if parsed.path.startswith("/api/mcp/servers/") and parsed.path.endswith("/test"):
+        name = parsed.path[len("/api/mcp/servers/"):-len("/test")]
+        return _handle_mcp_server_test(handler, name)
+
     # ── Checkpoints / Rollback (POST) ──
     if parsed.path == "/api/rollback/restore":
         if not body:
@@ -21129,6 +21134,67 @@ def _handle_mcp_servers_list(handler):
         "toggle_supported": True,
         "reload_required": True,
     })
+
+
+def _handle_mcp_server_test(handler, name):
+    """Test an MCP server connection by running hermes mcp test."""
+    from urllib.parse import unquote
+    import subprocess, re
+    name = unquote(name)
+    if not name:
+        return bad(handler, "name is required")
+    cfg = get_config()
+    servers = cfg.get("mcp_servers", {})
+    if not isinstance(servers, dict) or name not in servers:
+        return bad(handler, f"MCP server '{name}' not found", 404)
+    try:
+        proc = subprocess.run(
+            ["hermes", "mcp", "test", name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        # Parse latency: ✓ Connected (44ms)
+        latency_ms = None
+        lat_match = re.search(r"Connected\s*\((\d+)ms\)", stdout)
+        if lat_match:
+            latency_ms = int(lat_match.group(1))
+        # Parse tool count: ✓ Tools discovered: 35
+        tool_count = None
+        tc_match = re.search(r"Tools discovered:\s*(\d+)", stdout)
+        if tc_match:
+            tool_count = int(tc_match.group(1))
+        # Parse tool names
+        tools = []
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith(("Testing", "Transport:", "✓", "✗", "─", " " * 4)):
+                # Tool name lines start after the header
+                tools.append(stripped.split()[0] if stripped else "")
+        # Filter out non-tool lines
+        tools = [t for t in tools if t and not t.startswith(("MCP", "Tool"))]
+        if tool_count and len(tools) > tool_count:
+            tools = tools[:tool_count]
+        success = proc.returncode == 0 and "✓ Connected" in stdout
+        return j(handler, {
+            "ok": success,
+            "name": name,
+            "connected": success,
+            "latency_ms": latency_ms,
+            "tool_count": tool_count,
+            "tools": tools[:20],
+            "output": stdout[:2000],
+            "error": stderr[:500] if not success else None,
+        })
+    except subprocess.TimeoutExpired:
+        return j(handler, {"ok": False, "name": name, "connected": False, "error": "Test timed out after 30s"}, status=504)
+    except FileNotFoundError:
+        return j(handler, {"ok": False, "name": name, "connected": False, "error": "hermes CLI not found in PATH"}, status=500)
+    except Exception as e:
+        logger.exception("mcp test failed for %s", name)
+        return j(handler, {"ok": False, "name": name, "connected": False, "error": str(e)}, status=500)
 
 
 def _handle_mcp_server_delete(handler, name):

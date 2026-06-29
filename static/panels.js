@@ -10521,6 +10521,21 @@ function toggleMcpServer(name, enabled){
     loadMcpServers();
   }).catch(()=>{showToast(t('mcp_toggle_failed'),'error');loadMcpServers();});
 }
+function testMcpServer(name){
+  const testBtn=$('mcp-test-'+CSS.escape(encodeURIComponent(name)));
+  if(testBtn){testBtn.disabled=true;testBtn.textContent='…';}
+  api('/api/mcp/servers/'+encodeURIComponent(name)+'/test',{method:'POST'}).then(r=>{
+    if(r&&r.ok){
+      const parts=[];
+      if(r.latency_ms!=null) parts.push(r.latency_ms+'ms');
+      if(r.tool_count!=null) parts.push(r.tool_count+' tools');
+      showToast(t('mcp_test_success',name,parts.join(', ')));
+    } else {
+      showToast(t('mcp_test_failed',name,r&&r.error||t('mcp_status_unknown')),'error');
+    }
+    loadMcpServers();
+  }).catch(e=>{showToast(t('mcp_test_failed',name,e.message||'network error'),'error');loadMcpServers();});
+}
 function _refreshMcpToolsetsCatalog(payload){
   if(typeof window.invalidateToolsetsCatalog==='function') window.invalidateToolsetsCatalog(payload);
 }
@@ -10553,6 +10568,7 @@ function loadMcpServers(){
       const toggleBtn=r.toggle_supported
         ?`<button type="button" class="mcp-toggle-btn ${isEnabled?'mcp-toggle-enabled':'mcp-toggle-disabled'}" title="${esc(t(isEnabled?'mcp_disable_server':'mcp_enable_server'))}" onclick="toggleMcpServer('${encodedName}',${!isEnabled})">${esc(t(isEnabled?'mcp_enabled_yes':'mcp_enabled_no'))}</button>`
         :`<span>${esc(t(isEnabled?'mcp_enabled_yes':'mcp_enabled_no'))}</span>`;
+      const testBtn=`<button type="button" id="mcp-test-${encodedName}" class="mcp-toggle-btn" style="background:rgba(59,130,246,.12);color:#60a5fa;border-color:rgba(59,130,246,.25)" title="${esc(t('mcp_test_server'))}" onclick="testMcpServer('${encodedName}')">${esc(t('mcp_test_server'))}</button>`;
       return `<div class="mcp-server-row">
         <div class="mcp-server-row-head">
           <span class="mcp-server-name">${esc(s.name)}</span>
@@ -10560,7 +10576,7 @@ function loadMcpServers(){
           ${statusBadge}
         </div>
         <div class="mcp-server-detail">${esc(detail)}${secretInfo?' | '+esc(secretInfo):''}</div>
-        <div class="mcp-server-meta"><span class="mcp-tool-count">${esc(t('mcp_tool_count',toolCount))}</span>${toggleBtn}</div>
+        <div class="mcp-server-meta"><span class="mcp-tool-count">${esc(t('mcp_tool_count',toolCount))}</span>${toggleBtn}${testBtn}</div>
       </div>`;
     }).join('');
   }).catch(()=>{list.innerHTML=`<div class="mcp-error-state" style="color:#ef4444;font-size:12px;padding:6px 0">${esc(t('mcp_load_failed'))}</div>`});
