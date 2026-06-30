@@ -6,6 +6,7 @@ Behavior parity reference: gateway/run.py:_handle_*_command in
 the hermes-agent repo.
 """
 from __future__ import annotations
+import json
 import logging
 from typing import Any
 
@@ -109,11 +110,94 @@ def truncate_context_for_display_keep(
     msgs = full_messages if isinstance(full_messages, list) else []
     if not ctx:
         return []
-    if len(ctx) == len(msgs):
+    if len(ctx) <= len(msgs):
         return ctx[:keep]
     if len(msgs) == 0:
         return []
-    # Context tail aligns with full display transcript; preserve leading-only rows.
+
+    def _row_signature(row: Any) -> tuple[str, ...] | None:
+        if not isinstance(row, dict):
+            return None
+        tool_calls = row.get('tool_calls')
+        tool_calls_sig = json.dumps(tool_calls, sort_keys=True, default=str) if tool_calls else ''
+        return (
+            str(row.get('role') or ''),
+            str(row.get('content') or ''),
+            str(row.get('tool_call_id') or ''),
+            str(row.get('tool_use_id') or ''),
+            str(row.get('tool_name') or row.get('name') or ''),
+            tool_calls_sig,
+        )
+
+    def _first_match_from(message: Any, start_idx: int) -> tuple[int | None, int | None]:
+        msg_sig = _row_signature(message)
+        if msg_sig is None:
+            return None, None
+        msg_id = message.get('id')
+        msg_ts = message.get('timestamp')
+        weak_matches: list[int] = []
+        for idx in range(start_idx, len(ctx)):
+            context_row = ctx[idx]
+            context_sig = _row_signature(context_row)
+            if context_sig is None:
+                continue
+
+            context_id = context_row.get('id')
+            if context_id is not None and msg_id is not None:
+                if context_id == msg_id:
+                    return idx, None
+                continue
+
+            if context_sig != msg_sig:
+                continue
+
+            context_ts = context_row.get('timestamp')
+            if context_ts is not None and msg_ts is not None:
+                if context_ts == msg_ts:
+                    return idx, None
+                continue
+
+            weak_matches.append(idx)
+            if len(weak_matches) > 1:
+                return None, weak_matches[0]
+        return (weak_matches[0], None) if len(weak_matches) == 1 else (None, None)
+
+    matches = [None] * len(msgs)
+    ambiguous_matches = [None] * len(msgs)
+    next_ctx_idx = 0
+    for msg_idx, message in enumerate(msgs):
+        match_idx, ambiguous_idx = _first_match_from(message, next_ctx_idx)
+        matches[msg_idx] = match_idx
+        ambiguous_matches[msg_idx] = ambiguous_idx
+        if match_idx is not None:
+            next_ctx_idx = match_idx + 1
+
+    # Cut at the first unkept display turn, or fallback to the last kept turn
+    # if the boundary is not directly alignable.
+    if keep < len(msgs):
+        last_kept = None
+        if keep > 0:
+            last_kept = matches[keep - 1]
+        first_unkept = matches[keep]
+        if first_unkept is not None:
+            if (
+                last_kept is not None
+                and isinstance(msgs[keep - 1], dict)
+                and msgs[keep - 1].get('role') == 'user'
+            ):
+                return ctx[:last_kept + 1]
+            return ctx[:first_unkept]
+        if last_kept is not None:
+            ambiguous_first_unkept = ambiguous_matches[keep]
+            if (
+                ambiguous_first_unkept is not None
+                and isinstance(msgs[keep - 1], dict)
+                and msgs[keep - 1].get('role') != 'user'
+            ):
+                return ctx[:ambiguous_first_unkept]
+            return ctx[:last_kept + 1]
+
+    # Final fallback preserves #5096 behavior when alignment is unreliable.
     prefix_len = max(0, len(ctx) - len(msgs))
     prefix = ctx[:prefix_len]
     suffix = ctx[prefix_len:]

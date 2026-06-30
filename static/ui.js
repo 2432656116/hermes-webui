@@ -11773,6 +11773,14 @@ function _transparentStreamOrderedParts(message){
   }
   return hasText&&hasTool?ordered:null;
 }
+function _legacySettledFallbackHasToolMetadata(message){
+  if(!message||message.role!=='assistant'||message._anchor_activity_scene) return false;
+  return !!(
+    (Array.isArray(message.tool_calls)&&message.tool_calls.length>0)||
+    (Array.isArray(message._partial_tool_calls)&&message._partial_tool_calls.length>0)||
+    (Array.isArray(message.content)&&message.content.some(part=>part&&typeof part==='object'&&part.type==='tool_use'))
+  );
+}
 function _transparentOrderedDisplayText(text){
   return _stripWorkspaceDisplayPrefix(
     _stripAttachedFilesMarkerForDisplay(
@@ -12614,12 +12622,8 @@ function renderMessages(options){
   // tracking, or runs that didn't go through the normal streaming path), build
   // a display list from per-message tool_calls (OpenAI format) stored in each
   // assistant message. This covers the reload case described in issue #140.
-  const hasMessageToolMetadata=!S.busy&&Array.isArray(S.messages)&&S.messages.some(m=>
-    m&&m.role==='assistant'&&!anchorOwnedAssistantRawIdxs.has(S.messages.indexOf(m))&&(
-      (Array.isArray(m.tool_calls)&&m.tool_calls.length>0)||
-      (Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0)||
-      (Array.isArray(m.content)&&m.content.some(p=>p&&typeof p==='object'&&p.type==='tool_use'))
-    )
+  const hasMessageToolMetadata=!S.busy&&Array.isArray(S.messages)&&S.messages.some((m,rawIdx)=>
+    !anchorOwnedAssistantRawIdxs.has(rawIdx)&&_legacySettledFallbackHasToolMetadata(m)
   );
   if(!S.busy && (hasMessageToolMetadata||!S.toolCalls||!S.toolCalls.length)){
     // Index tool outputs by tool_call_id / tool_use_id so the
@@ -12664,10 +12668,7 @@ function renderMessages(options){
       }
       if(m.role==='assistant'){
         if(anchorOwnedAssistantRawIdxs.has(rawIdx)) return;
-        const hasTopLevelToolCalls=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
-        const hasPartialToolCalls=Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0;
-        const hasContentToolUse=Array.isArray(m.content)&&m.content.some(p=>p&&typeof p==='object'&&p.type==='tool_use');
-        if(hasTopLevelToolCalls||hasContentToolUse||hasPartialToolCalls) fallbackToolSources.push({m,rawIdx});
+        if(_legacySettledFallbackHasToolMetadata(m)) fallbackToolSources.push({m,rawIdx});
       }
     });
     const derived=[];

@@ -771,7 +771,12 @@ def test_anchor_owned_settled_turn_skips_legacy_worklog_rebuild():
     assert "anchorOwnedAssistantRawIdxs.add(idx)" in render
     assert "if(anchorOwnedAssistantRawIdxs.has(aIdx)) continue;" in render
     assert "if(anchorOwnedAssistantRawIdxs.has(rawIdx)) return;" in render
-    assert "!anchorOwnedAssistantRawIdxs.has(S.messages.indexOf(m))" in render
+    assert "S.messages.indexOf(m)" not in render
+    assert "S.messages.some((m,rawIdx)=>" in render
+    assert (
+        "!anchorOwnedAssistantRawIdxs.has(rawIdx)"
+        "&&_legacySettledFallbackHasToolMetadata(m)"
+    ) in render
 
 
 def test_transparent_stream_renders_persisted_anchor_scene_after_reload():

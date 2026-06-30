@@ -264,7 +264,9 @@ def test_phase0_doc_records_settled_fallback_ownership_matrix():
     assert "| Settled Compact Worklog activity |" in doc
     assert "| Settled Transparent Stream activity |" in doc
     assert "| Historical / non-anchor transcripts |" in doc
-    assert "This matrix is an audit baseline, not permission to delete fallbacks." in doc
+    assert "This matrix is the current settled-render contract" in doc
+    assert "compatibility-only rebuilds" in doc
+    assert "explicit raw transcript indexes" in doc
 
 
 def test_function_extractor_handles_nested_template_literal_interpolation():
@@ -404,6 +406,9 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
 
     render_source = _function_source(_ui_js(), "renderMessages")
     transparent_source = _function_source(_ui_js(), "_transparentStreamOrderedParts")
+    legacy_metadata_source = _function_source(
+        _ui_js(), "_legacySettledFallbackHasToolMetadata"
+    )
     script = textwrap.dedent(
         f"""
         class FakeClassList {{
@@ -677,6 +682,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
         }}
 
         eval({json.dumps(transparent_source)});
+        eval({json.dumps(legacy_metadata_source)});
         eval({json.dumps(render_source)});
 
         const toolResult = {{ role: 'tool', tool_call_id: 'toolu_1', content: 'tool result' }};
@@ -767,11 +773,58 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
           sToolCalls: S.toolCalls.length,
         }};
 
+        elements.msgInner = new FakeElement('div');
+        legacyCards = [];
+        const duplicateAnchorTool = {{ type: 'tool_use', id: 'toolu_anchor_dup', name: 'terminal', input: {{ cmd: 'anchor' }} }};
+        const duplicateHistoricalTool = {{ type: 'tool_use', id: 'toolu_hist_dup', name: 'terminal', input: {{ cmd: 'history' }} }};
+        const duplicateAnchorCall = {{
+          id: 'toolu_anchor_dup',
+          function: {{ name: 'terminal', arguments: '{{"cmd":"anchor"}}' }},
+        }};
+        const duplicateAnchorOwned = {{
+          role: 'assistant',
+          content: [{{ type: 'text', text: 'Duplicate answer' }}, duplicateAnchorTool],
+          tool_calls: [duplicateAnchorCall],
+          _anchor_activity_scene: {{
+            version: 'activity_scene_v1',
+            activity_rows: [{{ id: 'row-dup', kind: 'tool', role: 'tool', tool: {{ name: 'terminal' }} }}],
+            final_answer: 'Duplicate answer',
+          }},
+        }};
+        const duplicateHistorical = {{
+          role: 'assistant',
+          content: [{{ type: 'text', text: 'Duplicate answer' }}, duplicateHistoricalTool],
+        }};
+        S = {{
+          session: {{
+            session_id: 's4',
+            tool_calls: [{{ tid: 'toolu_hist_dup', snippet: 'historical persisted result' }}],
+          }},
+          messages: [
+            {{ role: 'user', content: 'anchor turn' }},
+            duplicateAnchorOwned,
+            {{ role: 'user', content: 'historical turn' }},
+            duplicateHistorical,
+            toolResult,
+          ],
+          toolCalls: [{{ tid: 'toolu_anchor_dup', assistant_msg_idx: 1, name: 'terminal', snippet: 'anchor session fallback' }}],
+          busy: false,
+        }};
+        renderMessages();
+        const duplicateReferenceSummary = {{
+          anchorGroups: elements.msgInner.querySelectorAll('[data-anchor-settled-scene-owner]').length,
+          legacyGroups: elements.msgInner.querySelectorAll('[data-legacy-fallback-owner]').length,
+          legacyRows: elements.msgInner.querySelectorAll('.tool-card-row').length,
+          legacyCards,
+          sToolCalls: S.toolCalls.length,
+        }};
+
         console.log(JSON.stringify({{
           selectorSanity,
           anchorSummary,
           historicalSummary,
           rawHistoricalSummary,
+          duplicateReferenceSummary,
         }}));
         """
     )
@@ -810,6 +863,15 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
     assert raw_snippets["partial_1"] == "partial result"
     assert raw_snippets["content_1"] == "persisted content result"
 
+    duplicate_cards = result["duplicateReferenceSummary"]["legacyCards"]
+    assert result["duplicateReferenceSummary"]["anchorGroups"] == 1
+    assert result["duplicateReferenceSummary"]["legacyGroups"] == 1
+    assert result["duplicateReferenceSummary"]["legacyRows"] >= 1
+    assert result["duplicateReferenceSummary"]["sToolCalls"] >= 1
+    assert {card["tid"] for card in duplicate_cards} == {"toolu_hist_dup"}
+    assert "toolu_anchor_dup" not in {card["tid"] for card in duplicate_cards}
+    assert duplicate_cards[0]["snippet"] == "historical persisted result"
+
 
 def test_settled_legacy_tool_rebuild_excludes_anchor_owned_turns():
     render = _function_body(_ui_js(), "renderMessages")
@@ -821,7 +883,9 @@ def test_settled_legacy_tool_rebuild_excludes_anchor_owned_turns():
     source_collect = render.index("fallbackToolSources.push({m,rawIdx});")
 
     assert set_decl < collect_segments < metadata_scan < fallback_sources < source_collect
-    assert "!anchorOwnedAssistantRawIdxs.has(S.messages.indexOf(m))" in render
+    assert "S.messages.indexOf(m)" not in render
+    assert "S.messages.some((m,rawIdx)=>" in render
+    assert "!anchorOwnedAssistantRawIdxs.has(rawIdx)&&_legacySettledFallbackHasToolMetadata(m)" in render
     assert "if(anchorOwnedAssistantRawIdxs.has(rawIdx)) return;" in render
 
 
