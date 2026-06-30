@@ -73,7 +73,7 @@ def _load_repo_dotenv() -> None:
 # values from .env even when bootstrap.py is invoked directly (not via start.sh).
 _load_repo_dotenv()
 
-DEFAULT_HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
+DEFAULT_HOST = os.getenv("HERMES_WEBUI_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
 # Set HERMES_WEBUI_SKIP_ONBOARDING=1 to bypass the first-run wizard when
 # the environment is already fully configured (e.g. managed hosting).
