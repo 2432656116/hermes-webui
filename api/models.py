@@ -3413,20 +3413,36 @@ class _ExternalSessionView:
 
 
 def get_session_for_file_ops(sid: str):
-    """Return a session-like object for file-manager handlers.
+    """Return a profile-authorized session-like object for file-manager handlers.
 
     Tries ``get_session`` first (preserves all existing behavior for WebUI
-    sessions). If that raises ``KeyError``, checks state.db; when the session
-    exists there, returns an ``_ExternalSessionView`` whose ``workspace`` is
-    the active WebUI workspace. If neither has the session, re-raises
+    sessions) and only returns that session when its stored profile belongs to
+    the active request profile.  If that lookup fails, checks state.db; when the
+    session exists there, returns an ``_ExternalSessionView`` whose ``workspace``
+    is the active WebUI workspace. If neither has the session, re-raises
     ``KeyError`` so callers continue to return their existing 404.
     """
     try:
-        return get_session(sid, metadata_only=True)
+        session = get_session(sid, metadata_only=True)
     except KeyError:
         if state_db_has_session(sid):
             return _ExternalSessionView(str(sid), str(get_last_workspace()))
         raise
+
+    from api.profiles import _profiles_match, get_active_profile_name
+
+    session_profile = getattr(session, 'profile', None)
+    active_profile = get_active_profile_name()
+    if not _profiles_match(session_profile, active_profile):
+        logger.debug(
+            "Rejected file-manager session for foreign profile: "
+            "session_id=%s session_profile=%r active_profile=%r",
+            sid,
+            session_profile,
+            active_profile,
+        )
+        raise KeyError(sid)
+    return session
 
 
 def _active_state_db_path() -> Path:
@@ -5632,6 +5648,17 @@ def _session_message_merge_key(msg: dict):
     )
 
 
+def _session_messages_have_prefix(messages, prefix) -> bool:
+    messages = list(messages or [])
+    prefix = list(prefix or [])
+    if len(prefix) > len(messages):
+        return False
+    for idx, expected in enumerate(prefix):
+        if _session_message_merge_key(messages[idx]) != _session_message_merge_key(expected):
+            return False
+    return True
+
+
 _SESSION_MESSAGE_DISPLAY_METADATA_KEYS = (
     "_turnDuration",
     "_turnTps",
@@ -6462,23 +6489,39 @@ def reconciled_state_db_messages_for_session(
         state_messages = get_state_db_session_messages(getattr(session, 'session_id', None))
     if prefer_context and local_messages:
         if using_context_messages:
-            compressed_context = _context_messages_include_compression_marker(local_messages)
-            anchor_key = getattr(session, "compression_anchor_message_key", None)
-            if compressed_context:
-                if not anchor_key:
-                    logger.debug(
-                        "Compressed context for session %s has no compression anchor; using context_messages only",
-                        getattr(session, "session_id", None),
-                    )
-                    return list(local_messages)
-                anchor_index = _state_db_anchor_index(state_messages, anchor_key)
-                if anchor_index is None:
-                    logger.debug(
-                        "Compressed context for session %s has an unverifiable compression anchor; using context_messages only",
-                        getattr(session, "session_id", None),
-                    )
-                    return list(local_messages)
-                state_messages = list(state_messages or [])[anchor_index + 1 :]
+            sidecar_messages = getattr(session, 'messages', None) or []
+            if (
+                getattr(session, 'is_cli_session', False)
+                and not getattr(session, 'read_only', False)
+                and sidecar_messages
+                and len(sidecar_messages) > len(local_messages)
+                and _session_messages_have_prefix(sidecar_messages, local_messages)
+            ):
+                # A claimed CLI sidecar can carry a stale context prefix while the
+                # stitched CLI transcript already landed in session.messages. On the
+                # first WebUI follow-up, prefer that longer authoritative transcript
+                # unless context_messages intentionally diverged via compaction or
+                # another non-prefix transform.
+                local_messages = sidecar_messages
+                using_context_messages = False
+            if using_context_messages:
+                compressed_context = _context_messages_include_compression_marker(local_messages)
+                anchor_key = getattr(session, "compression_anchor_message_key", None)
+                if compressed_context:
+                    if not anchor_key:
+                        logger.debug(
+                            "Compressed context for session %s has no compression anchor; using context_messages only",
+                            getattr(session, "session_id", None),
+                        )
+                        return list(local_messages)
+                    anchor_index = _state_db_anchor_index(state_messages, anchor_key)
+                    if anchor_index is None:
+                        logger.debug(
+                            "Compressed context for session %s has an unverifiable compression anchor; using context_messages only",
+                            getattr(session, "session_id", None),
+                        )
+                        return list(local_messages)
+                    state_messages = list(state_messages or [])[anchor_index + 1 :]
         state_messages = state_db_delta_after_context(local_messages, state_messages)
     return merge_session_messages_append_only(
         local_messages,
