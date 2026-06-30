@@ -7857,6 +7857,7 @@ _SETTINGS_DEFAULTS = {
     "hide_composer_toolsets": False,  # hide toolsets chip in composer footer
     "hide_composer_status": False,  # hide status text in composer footer
     "hide_composer_context": False,  # hide context indicator in composer footer/mobile config panel
+    "public_host_enabled": True,  # default bind to 0.0.0.0; toggle off to restrict to 127.0.0.1
     "hide_composer_bg_badge": False,  # hide background-jobs badge in composer footer
     "pinned_sessions_limit": 3,  # maximum active pinned sessions shown in the sidebar
     "inflight_state_max_sessions": 8,  # max active-stream recovery snapshots kept in browser localStorage
@@ -8104,6 +8105,7 @@ _SETTINGS_BOOL_KEYS = {
     "hide_composer_status",
     "hide_composer_context",
     "hide_composer_bg_badge",
+    "public_host_enabled",
 }
 # Language codes are validated as short alphanumeric BCP-47-like tags (e.g. 'en', 'zh', 'fr')
 _SETTINGS_LANG_RE = __import__("re").compile(r"^[a-zA-Z]{2,10}(-[a-zA-Z0-9]{2,8})?$")

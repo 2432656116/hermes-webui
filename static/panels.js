@@ -7716,6 +7716,12 @@ async function loadSettingsPanel(){
     }
     _ensureComposerControlVisibilityState(settings);
     _renderComposerControlChips();
+    // Public host binding toggle
+    const publicHostCb=$('settingsPublicHost');
+    if(publicHostCb){
+      publicHostCb.checked=settings.public_host_enabled!==false;
+      publicHostCb.onchange=function(){ _setPublicHost(this.checked); };
+    }
     _renderComposerSituationalControlChips();
     if(typeof _applyComposerFooterVisibilitySettings==='function') _applyComposerFooterVisibilitySettings();
     // Tab visibility/order chips (dynamically populated from DOM)
@@ -10600,6 +10606,7 @@ async function saveSettings(andClose){
   body.auto_scroll_follow=!!($('settingsAutoScrollFollow')||{}).checked;
   body.render_user_markdown=!!($('settingsRenderUserMarkdown')||{}).checked;
   body.large_text_paste_as_attachment=!!($('settingsLargeTextPasteAsAttachment')||{}).checked;
+  body.public_host_enabled=!!($('settingsPublicHost')||{}).checked;
   Object.assign(body,_structuredCodeViewFromUi());
   body.language=language;
   body.show_token_usage=showTokenUsage;
@@ -11347,4 +11354,28 @@ function runDiagnostics(){
     btn.disabled = false;
     btn.textContent = t('diag_run')||'Run Diagnostics';
   });
+}
+
+// ── Public host binding toggle ───────────────────────────────────────────
+async function _setPublicHost(enabled){
+  const statusEl=$('settingsPublicHostStatus');
+  try{
+    const saved=await api('/api/settings',{method:'POST',body:JSON.stringify({public_host_enabled:!!enabled})});
+    if(saved&&saved.public_host_needs_restart){
+      if(statusEl){
+        statusEl.style.display='block';
+        statusEl.textContent=(t('settings_public_host_restart')||'Saved. Restart WebUI for changes to take effect.')+(enabled?' (0.0.0.0)':' (127.0.0.1)');
+      }
+    }else if(statusEl){
+      statusEl.style.display='none';
+    }
+  }catch(e){
+    if(statusEl){
+      statusEl.style.display='block';
+      statusEl.style.color='#ef4444';
+      statusEl.textContent='Save failed: '+esc(e.message);
+    }
+    const cb=$('settingsPublicHost');
+    if(cb) cb.checked=!enabled;
+  }
 }

@@ -8268,6 +8268,33 @@ def _handle_logs(handler, parsed) -> bool:
         logger.exception("Failed to read whitelisted log file %s", file_key)
         return bad(handler, _sanitize_error(exc), status=500)
 
+# ── Host binding helper for web settings toggle ────────────────────────────────
+
+def _sync_public_host_env(enabled: bool) -> None:
+    """Write or remove HERMES_WEBUI_HOST in REPO_ROOT/.env to match the toggle."""
+    from api.config import REPO_ROOT as _REPO_ROOT
+    env_file = _REPO_ROOT / ".env"
+    try:
+        lines = []
+        if env_file.exists():
+            lines = env_file.read_text(encoding="utf-8").splitlines()
+        new_lines = []
+        found = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("HERMES_WEBUI_HOST=") or stripped == "HERMES_WEBUI_HOST":
+                found = True
+                if not enabled:
+                    new_lines.append("HERMES_WEBUI_HOST=127.0.0.1")
+                # else: skip this line (remove it, reverting to default 0.0.0.0)
+                continue
+            new_lines.append(line)
+        if not found and not enabled:
+            new_lines.append("HERMES_WEBUI_HOST=127.0.0.1")
+        env_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
 # ── Insights endpoint ──────────────────────────────────────────────────────────
 
 _LLM_WIKI_DOCS_URL = "https://hermes-agent.nousresearch.com/docs/user-guide/skills/bundled/research/research-llm-wiki"
@@ -13149,6 +13176,11 @@ def handle_post(handler, parsed) -> bool:
             max_tokens_status = set_max_tokens(max_tokens_value)
         saved.pop("password_hash", None)  # never expose hash to client
         saved.update(max_tokens_status if max_tokens_provided else get_max_tokens_status())
+
+        # Handle public_host_enabled toggle — write HERMES_WEBUI_HOST to .env
+        if "public_host_enabled" in body:
+            _sync_public_host_env(bool(body["public_host_enabled"]))
+            saved["public_host_needs_restart"] = True if "public_host_enabled" in body else saved.get("public_host_needs_restart", False)
 
         # Settings that change which sessions appear in the sidebar must
         # invalidate the session-list cache directly. Relying on the cache's
