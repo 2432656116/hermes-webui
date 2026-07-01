@@ -79,9 +79,9 @@ fi
 #
 # Resolve host/port the same way bootstrap.py does: HERMES_WEBUI_HOST /
 # HERMES_WEBUI_PORT (possibly just sourced from .env above), else the
-# bootstrap.py defaults of 127.0.0.1 / 8787. A 0.0.0.0 / :: bind is probed via
+# bootstrap.py defaults of 0.0.0.0 / 8787. A 0.0.0.0 / :: bind is probed via
 # loopback, matching server.py's _abort_if_already_serving.
-_hermes_host="${HERMES_WEBUI_HOST:-127.0.0.1}"
+_hermes_host="${HERMES_WEBUI_HOST:-0.0.0.0}"
 _hermes_port="${HERMES_WEBUI_PORT:-8787}"
 
 # CLI args override the env/defaults exactly as bootstrap.py's argparse does

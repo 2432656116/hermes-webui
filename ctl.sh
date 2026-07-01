@@ -92,7 +92,7 @@ _find_python() {
 }
 
 _parse_launch_binding() {
-  CTL_HOST="${HERMES_WEBUI_HOST:-127.0.0.1}"
+  CTL_HOST="${HERMES_WEBUI_HOST:-0.0.0.0}"
   CTL_PORT="${HERMES_WEBUI_PORT:-8787}"
   local arg next_is_host=0 saw_port=0
   for arg in "$@"; do
@@ -448,7 +448,7 @@ status_cmd() {
   ensure_home
   _load_repo_dotenv_preserving_env
   _load_state_if_present
-  local host="${HOST:-${HERMES_WEBUI_HOST:-127.0.0.1}}"
+  local host="${HOST:-${HERMES_WEBUI_HOST:-0.0.0.0}}"
   local port="${PORT:-${HERMES_WEBUI_PORT:-8787}}"
   local log_path="${LOG_FILE}"
   local pid uptime health
