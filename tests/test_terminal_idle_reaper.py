@@ -340,3 +340,53 @@ def test_teardown_runs_without_holding_the_registry_lock(monkeypatch):
     terminal._reap_idle_terminals(time.time())
 
     assert observed.get("free") is True, "_LOCK was held across process teardown"
+
+
+def test_a_header_write_failure_after_attach_still_unsubscribes(monkeypatch):
+    """Attaching before the headers must not be able to leak the subscriber.
+
+    `attach_terminal()` subscribes, and only then are the response headers
+    written. A client that dropped in that instant makes `end_headers()` raise
+    BrokenPipeError; if that escaped before the try/finally, the queue would
+    stay in `_subscribers` forever, pin `unwatched_since` at None, and make the
+    terminal permanently unreapable — the very leak this reaper exists to
+    prevent, self-inflicted.
+    """
+    import io
+    from types import SimpleNamespace
+
+    import api.routes as routes
+
+    sid = "sse-header-failure"
+    term = _make_registered_term(monkeypatch, sid, unwatched_since=_expired_since())
+
+    class _Handler:
+        headers = {}
+
+        def __init__(self):
+            self.wfile = io.BytesIO()
+            self.status = None
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, _name, _value):
+            pass
+
+        def end_headers(self):
+            raise ConnectionResetError("client vanished")
+
+    monkeypatch.setattr(routes, "_embedded_terminal_gate_allows", lambda _handler: True)
+    monkeypatch.setattr(routes, "_sse_set_write_deadline", lambda _handler: None)
+
+    routes._handle_terminal_output(
+        _Handler(), SimpleNamespace(query=f"session_id={sid}")
+    )
+
+    assert term._subscribers == [], "the subscriber leaked on a header-write failure"
+    assert term.unwatched_since is not None, "the terminal was pinned as watched forever"
+    # The grace restarts from the detach, which is correct — but the terminal
+    # is reapable again once it elapses, instead of being pinned forever.
+    assert terminal._reap_idle_terminals(
+        term.unwatched_since + terminal._TERMINAL_IDLE_GRACE_SECONDS + 1
+    ) == 1

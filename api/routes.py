@@ -17865,14 +17865,21 @@ def _handle_terminal_output(handler, parsed):
         return j(handler, {"error": "terminal not running"}, status=404)
     term, output = attached
 
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
-    handler.send_header("Cache-Control", "no-cache")
-    handler.send_header("X-Accel-Buffering", "no")
-    handler.send_header("Connection", "close")
-    end_sse_headers(handler)
-    _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
+    # The subscription is live from here on, so EVERY exit path — including a
+    # failure while writing the response headers — must unsubscribe. Writing
+    # headers to a client that already dropped raises BrokenPipeError, and if
+    # that escaped before the try block the queue would stay in
+    # `_subscribers` forever, pinning `unwatched_since` at None and making the
+    # terminal permanently unreapable: the exact fd/thread leak this reaper
+    # exists to prevent. Hence the try starts immediately after the attach.
     try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.send_header("Connection", "close")
+        end_sse_headers(handler)
+        _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
         while True:
             try:
                 event_seq, event, data = output.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
